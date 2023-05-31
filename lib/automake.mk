@@ -205,6 +205,9 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/netdev-offload.h \
 	lib/netdev-offload-provider.h \
 	lib/netdev-provider.h \
+	lib/netdev-virtuoso.c \
+	lib/netdev-virtuoso.h \
+	lib/netdev-virtuoso-private.h \
 	lib/netdev-vport.c \
 	lib/netdev-vport.h \
 	lib/netdev-vport-private.h \
