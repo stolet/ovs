@@ -70,7 +70,8 @@ netdev_virtuoso_construct(struct netdev *netdev_)
   eth_addr_random(&dev->etheraddr);
 
   if (name && dpif_port && (strlen(name) > strlen(dpif_port) + 1) &&
-    (!strncmp(name, dpif_port, strlen(dpif_port)))) {
+    (!strncmp(name, dpif_port, strlen(dpif_port)))) 
+  {
     p = name + strlen(dpif_port) + 1;
     port = atoi(p);
   }
@@ -89,8 +90,146 @@ netdev_virtuoso_destruct(struct netdev *netdev_)
 }
 
 static void 
-virtuoso_dealloc(struct netdev *netdev_)
+netdev_virtuoso_dealloc(struct netdev *netdev_)
 {
   struct netdev_virtuoso *netdev = netdev_virtuoso_cast(netdev_);
   free(netdev);
 }
+
+static int
+netdev_virtuoso_set_etheraddr(struct netdev *netdev_, 
+                              const struct eth_addr mac)
+{
+    struct netdev_virtuoso *netdev = netdev_virtuoso_cast(netdev_);
+
+    ovs_mutex_lock(&netdev->mutex);
+    netdev->etheraddr = mac;
+    ovs_mutex_unlock(&netdev->mutex);
+    netdev_change_seq_changed(netdev_);
+
+    return 0;
+}
+
+static int
+netdev_virtuoso_get_etheraddr(const struct netdev *netdev_, 
+                              struct eth_addr *mac)
+{
+    struct netdev_virtuoso *netdev = netdev_virtuoso_cast(netdev_);
+
+    ovs_mutex_lock(&netdev->mutex);
+    *mac = netdev->etheraddr;
+    ovs_mutex_unlock(&netdev->mutex);
+
+    return 0;
+}
+
+static int
+netdev_vport_update_flags(struct netdev *netdev OVS_UNUSED,
+                          enum netdev_flags off,
+                          enum netdev_flags on OVS_UNUSED,
+                          enum netdev_flags *old_flagsp)
+{
+    if (off & (NETDEV_UP)) 
+    {
+        return EOPNOTSUPP;
+    }
+
+    *old_flagsp = NETDEV_UP;
+    return 0;
+}
+
+/* Performs periodic work needed by Virtuoso */
+static void
+netdev_virtuoso_run(const struct netdev_class *netdev_class OVS_UNUSED)
+{
+  return;
+}
+
+/* Arranges for poll_block to wake up if run function needs to be called */
+static void 
+netdev_virtuoso_wait(const struct netdev_class *netdev_class OVS_UNUSED)
+{
+  return;
+}
+
+static int
+netdev_virtuoso_get_queue(const struct netdev *netdev_,
+                          unsigned int queue_id, struct smap *details)
+{
+
+}
+
+static int
+netdev_virtuoso_set_queue(struct netdev *netdev_,
+                          unsigned int queue_id, const struct smap *details)
+{
+
+}
+
+static int
+netdev_virtuoso_delete_queue(struct netdev *netdev_, unsigned int queue_id)
+{
+
+}
+
+static int
+netdev_virtuoso_send(struct netdev *netdev_, int qid OVS_UNUSED,
+                     struct dp_packet_batch *batch,
+                     bool concurrent_txq OVS_UNUSED)
+{
+
+}
+
+void
+netdev_virtuoso_send_wait(struct netdev *netdev, int qid OVS_UNUSED)
+{
+
+}
+
+static struct netdev_rxq *
+netdev_virtuoso_rxq_alloc(void)
+{
+
+}
+
+static void
+netdev_virtuoso_rxq_dealloc(struct netdev_rxq *rxq_)
+{
+
+}
+
+static int
+netdev_virtuoso_rxq_recv(struct netdev_rxq *rxq_, 
+                         struct dp_packet_batch *batch, int *qfill)
+{
+
+}
+
+static void
+netdev_virtuoso_rxq_wait(struct netdev_rxq *rxq_)
+{
+
+}
+
+static int
+netdev_virtuoso_rxq_drain(struct netdev_rxq *rxq_)
+{
+
+}
+
+#define NETDEV_VIRTUOSO_CLASS_COMMON
+  .run = netdev_virtuoso_run                         \
+  .wait = netdev_virtuoso_wait                       \
+  .alloc = netdev_virtuoso_alloc,                    \
+  .construct = netdev_virtuoso_construct,            \
+  .destruct = netdev_virtuoso_destruct,              \
+  .dealloc = netdev_virtuoso_dealloc,                \
+  .set_etheraddr = netdev_virtuoso_set_etheraddr,    \
+  .get_etheraddr = netdev_virtuoso_get_etheraddr,    \
+  .get_stats = netdev_virtuoso_get_stats,            \
+  .update_flags = netdev_virtuoso_get_flags,         \
+
+const struct netdev_class netdev_virtuoso_class = {
+  NETDEV_VIRTUOSO_CLASS_COMMON,
+  .type = "virtuoso"
+};

@@ -1,5 +1,5 @@
-#ifndef NETDEV_VPORT_PRIVATE_H
-#define NETDEV_VPORT_PRAVITE_H 1
+#ifndef NETDEV_VIRTUOSO_PRIVATE_H
+#define NETDEV_VIRTUOSO_PRIVATE_H 1
 
 #include <stdbool.h>
 
