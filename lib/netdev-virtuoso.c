@@ -311,13 +311,16 @@ netdev_virtuoso_send_wait(struct netdev *netdev OVS_UNUSED, int qid OVS_UNUSED)
 static int
 netdev_virtuoso_rxq_construct(struct netdev_rxq *rxq_ OVS_UNUSED)
 {
+  struct netdev_rxq_virtuoso *rx = netdev_rxq_virtuoso_cast(rxq_);
+
+  rx->rx_tail = 0;
   return 0;
 }
 
 static void
 netdev_virtuoso_rxq_destruct(struct netdev_rxq *rxq_ OVS_UNUSED)
 {
-
+  return;
 }
 
 static struct netdev_rxq *
@@ -341,29 +344,31 @@ netdev_virtuoso_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   int mtu;
   size_t len;
   struct dp_packet *ovs_buf;
-  volatile struct flextcp_pl_appctx *kctx = &fp_state->kctx[0];
-  volatile struct flextcp_pl_krx *krx;
+  struct netdev_rxq_virtuoso *rx = netdev_rxq_virtuoso_cast(rxq_);;
+  volatile struct flextcp_pl_ovsctx *ovsctx = &fp_state->ovsctx;
+  volatile struct flextcp_pl_tasovs *tasovs;
   struct nic_buffer *virtuoso_buf;
   uintptr_t addr;
   uint8_t type;
 
-  addr = kctx->rx_base + kctx->rx_tail;
-  len = sizeof(*krx);
+  addr = ovsctx->tasovs_base + rx->rx_tail;
+  len = sizeof(*tasovs);
 
   ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  krx = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  tasovs = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
 
   /* Kernel queue empty so do nothing */
-  type = krx->type;
-  if (type == FLEXTCP_PL_KRX_INVALID)
+  type = tasovs->type;
+  if (type == FLEXTCP_PL_TASOVS_INVALID)
   {
     return 0;
   }
 
+  VLOG_INFO("Got kernel message from Virtuoso");
   /* Get packet from shm */
-  len = krx->msg.packet.len;
+  len = tasovs->msg.packet.len;
   virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] 
-      + krx->addr + kctx->rx_tail);
+      + tasovs->addr + rx->rx_tail);
 
   /* Add packet to datapath batch */
   mtu = ETH_PAYLOAD_MAX;
@@ -373,6 +378,12 @@ netdev_virtuoso_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   memcpy(dp_packet_data(ovs_buf), virtuoso_buf, len);
   dp_packet_set_size(ovs_buf, len);
   dp_packet_batch_add(batch, ovs_buf);
+
+  tasovs->type = 0;
+  
+  rx->rx_tail = rx->rx_tail + 1;
+  if (rx->rx_tail == info->tasovs_len)
+    rx->rx_tail -= info->tasovs_len;
 
   return 0;
 }

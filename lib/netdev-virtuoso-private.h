@@ -18,6 +18,7 @@ struct netdev_virtuoso {
 
 struct netdev_rxq_virtuoso {
   struct netdev_rxq up;
+  uint32_t rx_tail;
   int fd;
 };
 
