@@ -27,6 +27,9 @@ AM_CPPFLAGS += -I $(top_builddir)/include
 AM_CPPFLAGS += -I $(top_srcdir)/lib
 AM_CPPFLAGS += -I $(top_builddir)/lib
 
+AM_CPPFLAGS += -I /local/mstolet/projects/tas/include
+AM_CPPFLAGS += -I /local/mstolet/projects/tas/tas/include
+
 AM_CPPFLAGS += $(SSL_INCLUDES)
 
 AM_CFLAGS = -Wstrict-prototypes

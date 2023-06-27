@@ -41,6 +41,7 @@
 #include "openvswitch/list.h"
 #include "netdev-offload-provider.h"
 #include "netdev-provider.h"
+#include "netdev-virtuoso.h"
 #include "netdev-vport.h"
 #include "odp-netlink.h"
 #include "openflow/openflow.h"
@@ -146,6 +147,7 @@ netdev_initialize(void)
         netdev_vport_patch_register();
 
 #ifdef __linux__
+        netdev_register_provider(&netdev_virtuoso_class);
         netdev_register_provider(&netdev_linux_class);
         netdev_register_provider(&netdev_internal_class);
         netdev_register_provider(&netdev_tap_class);

@@ -979,11 +979,19 @@ odp_execute_actions(void *dp, struct dp_packet_batch *batch, bool steal,
     const struct nlattr *a;
     unsigned int left;
 
+    DP_PACKET_BATCH_FOR_EACH (i, packet, batch) {
+        struct flow flow;
+        flow_extract(packet, &flow);
+        VLOG_INFO("flow src=%08x dst=%08x tcp_src=%05u tcp_dst=%05u tun_src=%08x tun_dst=%08x tun_id=%d",
+                ntohl(flow.nw_src), ntohl(flow.nw_dst), ntohs(flow.tp_src), ntohs(flow.tp_dst), 
+                ntohl(flow.tunnel.ip_dst), ntohl(flow.tunnel.ip_src), ntohl(flow.tunnel.tun_id));
+    }
+
     NL_ATTR_FOR_EACH_UNSAFE (a, left, actions, actions_len) {
         int type = nl_attr_type(a);
         enum ovs_action_attr attr_type = (enum ovs_action_attr) type;
         bool last_action = (left <= NLA_ALIGN(a->nla_len));
-
+        VLOG_INFO("ACTION ATTRIBUTE TYPE %d", attr_type);
         if (requires_datapath_assistance(a)) {
             if (dp_execute_action) {
                 /* Allow 'dp_execute_action' to steal the packet data if we do
