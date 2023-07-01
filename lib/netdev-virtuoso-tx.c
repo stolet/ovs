@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <net/if.h>
+#include <rte_memcpy.h>
 
 #include <tas_memif.h>
 
@@ -19,6 +20,7 @@
 #include "dp-packet.h"
 #include "dpif-netdev.h"
 #include "netdev-native-tnl.h"
+#include "ovs-rcu.h"
 #include "openvswitch/vlog.h"
 
 
@@ -130,6 +132,7 @@ netdev_virtuosotx_construct(struct netdev *netdev_)
   void *m;
 
   ovs_mutex_init(&dev->mutex);
+  ovs_mutex_init(&dev->tx_mutex);
   /* TODO: Revisit this and figure out if we 
      want a random address or something else */
   eth_addr_random(&dev->etheraddr);
@@ -312,7 +315,52 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
                        struct dp_packet_batch *batch OVS_UNUSED,
                        bool concurrent_txq OVS_UNUSED)
 {
-  VLOG_INFO("Called Virtuoso send");
+  int packet_drops = 0;
+  uint16_t len;
+  struct netdev_virtuosotx *netdev = netdev_virtuosotx_cast(netdev_);
+  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
+  volatile struct flextcp_pl_ote *ote;
+  struct dp_packet *pkt;
+  uintptr_t addr;
+  void *buf_addr;
+
+  ovs_mutex_lock(&netdev->tx_mutex);
+  DP_PACKET_BATCH_FOR_EACH(i, pkt, batch)
+  {
+    addr = ovstas->base + netdev->tx_head;
+    len = sizeof(*ote);
+
+    ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
+    ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+
+    if (ote->type != 0) {
+      packet_drops++;
+      continue;
+    }
+
+    ovstas->head += sizeof(*ote);
+    if (ovstas->head >= ovstas->len)
+      ovstas->head -= ovstas->len;
+
+    len = dp_packet_size(pkt);
+    buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
+    rte_memcpy(buf_addr, dp_packet_data(pkt), len);
+
+    ote->msg.packet.len = len;
+    ote->msg.packet.flow_group = pkt->md.flow_group;
+    ote->msg.packet.fn_core = pkt->md.fn_core;
+    MEM_BARRIER();
+
+    ote->type = FLEXTCP_PL_OTE_VALID;
+  }
+
+  if (packet_drops > 0)
+  {
+    ovs_mutex_unlock(&netdev->tx_mutex);
+    return packet_drops;
+  }
+
+  ovs_mutex_unlock(&netdev->tx_mutex);
   return 0;
 }
 
@@ -321,6 +369,18 @@ netdev_virtuosotx_send_wait(struct netdev *netdev OVS_UNUSED, int qid OVS_UNUSED
 {
   
 }
+
+// static const struct netdev_tunnel_config *
+// vport_tunnel_config(struct netdev_vport *netdev)
+// {
+//     return ovsrcu_get(const struct netdev_tunnel_config *, &netdev->tnl_cfg);
+// }
+
+// static const struct netdev_tunnel_config *
+// get_netdev_tunnel_config(const struct netdev *netdev)
+// {
+//     return vport_tunnel_config(netdev_vport_cast(netdev));
+// }
 
 #define NETDEV_VIRTUOSO_COMMON_FUNCTIONS                     \
   .run = netdev_virtuosotx_run,                              \
@@ -332,7 +392,9 @@ netdev_virtuosotx_send_wait(struct netdev *netdev OVS_UNUSED, int qid OVS_UNUSED
   .set_etheraddr = netdev_virtuosotx_set_etheraddr,          \
   .get_etheraddr = netdev_virtuosotx_get_etheraddr,          \
   .update_flags = netdev_virtuosotx_update_flags,            \
-  .pop_header = netdev_gre_pop_header
+  .build_header = netdev_gre_build_header,                   \
+  .pop_header = netdev_gre_pop_header,                       \
+  .push_header = netdev_gre_push_header                     
 
 #define NETDEV_VIRTUOSO_SEND_FUNCTIONS                       \
   .send = netdev_virtuosotx_send,                            \

@@ -119,6 +119,8 @@ PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
     struct conn *conn;          /* Cached conntrack connection. */
     bool reply;                 /* True if reply direction. */
     bool icmp_related;          /* True if ICMP related. */
+    uint16_t fn_core;           /* Useed by Virtuoso to identify fast-path core */
+    uint16_t flow_group;        /* Used by Virtuoso to identify flow group */
 );
 
 PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline1,

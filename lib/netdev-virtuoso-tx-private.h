@@ -9,9 +9,11 @@
 struct netdev_virtuosotx {
   struct netdev up;
 
+  struct ovs_mutex tx_mutex;
+  uint32_t tx_head;
+
   /* Protects all members below. */
   struct ovs_mutex mutex;
-
   struct eth_addr etheraddr;
   struct netdev_stats stats;
 };

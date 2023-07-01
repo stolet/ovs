@@ -847,7 +847,8 @@ extern const struct netdev_class netdev_bsd_class;
 #elif defined(_WIN32)
 extern const struct netdev_class netdev_windows_class;
 #else
-extern const struct netdev_class netdev_virtuoso_class;
+extern const struct netdev_class netdev_virtuosorx_class;
+extern const struct netdev_class netdev_virtuosotx_class;
 extern const struct netdev_class netdev_linux_class;
 #endif
 extern const struct netdev_class netdev_internal_class;

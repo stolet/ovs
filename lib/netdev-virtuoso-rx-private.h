@@ -11,14 +11,12 @@ struct netdev_virtuosorx {
 
   /* Protects all members below. */
   struct ovs_mutex mutex;
-
   struct eth_addr etheraddr;
   struct netdev_stats stats;
 };
 
 struct netdev_rxq_virtuosorx {
   struct netdev_rxq up;
-  uint32_t rx_tail;
   int fd;
 };
 

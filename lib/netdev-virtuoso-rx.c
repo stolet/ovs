@@ -310,9 +310,6 @@ netdev_virtuosorx_wait(const struct netdev_class *netdev_class OVS_UNUSED)
 static int
 netdev_virtuosorx_rxq_construct(struct netdev_rxq *rxq_ OVS_UNUSED)
 {
-  struct netdev_rxq_virtuosorx *rx = netdev_rxq_virtuosorx_cast(rxq_);
-
-  rx->rx_tail = 0;
   return 0;
 }
 
@@ -343,32 +340,30 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   int mtu;
   uint16_t len;
   struct dp_packet *pkt;
-  struct netdev_rxq_virtuosorx *rx = netdev_rxq_virtuosorx_cast(rxq_);;
   volatile struct flextcp_pl_ovsctx *tasovs = &fp_state->tasovs;
-  volatile struct flextcp_pl_ovsrx *ovsrx;
+  volatile struct flextcp_pl_toe *toe;
   void *virtuoso_buf;
   uintptr_t addr;
   uint8_t type;
 
-  addr = tasovs->rx_base + rx->rx_tail;
-  len = sizeof(*ovsrx);
+  addr = tasovs->base + tasovs->tail;
+  len = sizeof(*toe);
 
   ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  ovsrx = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  toe = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
 
   /* Kernel queue empty so do nothing */
-  type = ovsrx->type;
-  if (type == FLEXTCP_PL_OVSRX_INVALID)
+  type = toe->type;
+  if (type == FLEXTCP_PL_TOE_INVALID)
   {
     return EAGAIN;
   }
 
   VLOG_INFO("Got kernel message from Virtuoso");
-  VLOG_INFO("fn_core=%d addr=%ld len=%d", ovsrx->msg.packet.fn_core, ovsrx->addr, ovsrx->msg.packet.len);
+  VLOG_INFO("fn_core=%d addr=%ld len=%d", toe->msg.packet.fn_core, toe->addr, toe->msg.packet.len);
   /* Get packet from shm */
-  len = ovsrx->msg.packet.len;
-  virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] 
-      + ovsrx->addr + rx->rx_tail);
+  len = toe->msg.packet.len;
+  virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] + toe->addr);
 
   struct eth_hdr *eth = virtuoso_buf;
   struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
@@ -387,6 +382,7 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   dp_packet_batch_init(batch);
 
   pkt = dp_packet_new_with_headroom(len + mtu, DP_NETDEV_HEADROOM);
+  VLOG_INFO("Packet size before adding data or anything = %d", dp_packet_size(pkt));
   memcpy(dp_packet_data(pkt), virtuoso_buf, len);
   // eth = dp_packet_data(pkt);
   // out_ip = (struct ip_hdr *)(eth + 1);
@@ -395,15 +391,19 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   // tcp = (struct tcp_hdr *)(in_ip + 1);
   // dp_packet_set_l3(pkt, out_ip);
   // dp_packet_set_l4(pkt, gre);
-  dp_packet_set_size(pkt, len + dp_packet_size(pkt));
+  VLOG_INFO("Packet size after copying data = %d", dp_packet_size(pkt));
+  dp_packet_set_size(pkt, len);
+  pkt->md.flow_group = toe->msg.packet.flow_group;
+  pkt->md.fn_core = toe->msg.packet.fn_core;
+  VLOG_INFO("Packet size after set size = %d", dp_packet_size(pkt));
   // pkt->packet_type = htonl(PT_ETH);
   // pkt = netdev_gre_pop_header(pkt);
 
-  rx->rx_tail = rx->rx_tail + 1;
-  if (rx->rx_tail == info->nic_rx_len)
-    rx->rx_tail -= info->nic_rx_len;
+  tasovs->tail = tasovs->tail + 1;
+  if (tasovs->tail == (info->nic_rx_len + info->nic_tx_len))
+    tasovs->tail -= (info->nic_rx_len + info->nic_tx_len);
 
-  ovsrx->type = 0;
+  toe->type = 0;
   
   if (!pkt)
   {
@@ -427,6 +427,18 @@ netdev_virtuosorx_rxq_drain(struct netdev_rxq *rxq_ OVS_UNUSED)
   return 0;
 }
 
+// static const struct netdev_tunnel_config *
+// vport_tunnel_config(struct netdev_vport *netdev)
+// {
+//     return ovsrcu_get(const struct netdev_tunnel_config *, &netdev->tnl_cfg);
+// }
+
+// static const struct netdev_tunnel_config *
+// get_netdev_tunnel_config(const struct netdev *netdev)
+// {
+//     return vport_tunnel_config(netdev_vport_cast(netdev));
+// }
+
 #define NETDEV_VIRTUOSORX_COMMON_FUNCTIONS                   \
   .run = netdev_virtuosorx_run,                              \
   .wait = netdev_virtuosorx_wait,                            \
@@ -437,7 +449,9 @@ netdev_virtuosorx_rxq_drain(struct netdev_rxq *rxq_ OVS_UNUSED)
   .set_etheraddr = netdev_virtuosorx_set_etheraddr,          \
   .get_etheraddr = netdev_virtuosorx_get_etheraddr,          \
   .update_flags = netdev_virtuosorx_update_flags,            \
-  .pop_header = netdev_gre_pop_header
+  .build_header = netdev_gre_build_header,                   \
+  .pop_header = netdev_gre_pop_header,                       \
+  .push_header = netdev_gre_push_header                     
 
 #define NETDEV_VIRTUOSORX_RX_FUNCTIONS                       \
   .rxq_construct = netdev_virtuosorx_rxq_construct,          \
