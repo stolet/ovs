@@ -346,7 +346,7 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   uintptr_t addr;
   uint8_t type;
 
-  addr = tasovs->base + tasovs->tail;
+  addr = tasovs->rx_base + tasovs->rx_tail;
   len = sizeof(*toe);
 
   ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
@@ -399,9 +399,9 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   // pkt->packet_type = htonl(PT_ETH);
   // pkt = netdev_gre_pop_header(pkt);
 
-  tasovs->tail = tasovs->tail + 1;
-  if (tasovs->tail == (info->nic_rx_len + info->nic_tx_len))
-    tasovs->tail -= (info->nic_rx_len + info->nic_tx_len);
+  tasovs->rx_tail = tasovs->rx_tail + 1;
+  if (tasovs->rx_tail == info->nic_rx_len)
+    tasovs->rx_tail -= info->nic_rx_len;
 
   toe->type = 0;
   

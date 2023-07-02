@@ -327,7 +327,7 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
   ovs_mutex_lock(&netdev->tx_mutex);
   DP_PACKET_BATCH_FOR_EACH(i, pkt, batch)
   {
-    addr = ovstas->base + netdev->tx_head;
+    addr = ovstas->rx_base + netdev->tx_head;
     len = sizeof(*ote);
 
     ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
@@ -338,9 +338,9 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
       continue;
     }
 
-    ovstas->head += sizeof(*ote);
-    if (ovstas->head >= ovstas->len)
-      ovstas->head -= ovstas->len;
+    ovstas->rx_head += sizeof(*ote);
+    if (ovstas->rx_head >= ovstas->rx_len)
+      ovstas->rx_head -= ovstas->rx_len;
 
     len = dp_packet_size(pkt);
     buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
