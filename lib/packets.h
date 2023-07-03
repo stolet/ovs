@@ -119,8 +119,8 @@ PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
     struct conn *conn;          /* Cached conntrack connection. */
     bool reply;                 /* True if reply direction. */
     bool icmp_related;          /* True if ICMP related. */
-    uint16_t fn_core;           /* Useed by Virtuoso to identify fast-path core */
-    uint16_t flow_group;        /* Used by Virtuoso to identify flow group */
+    /* Virtuoso fields */
+    
 );
 
 PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline1,
@@ -134,6 +134,19 @@ PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline2,
     struct flow_tnl tunnel;     /* Encapsulating tunnel parameters. Note that
                                  * if 'ip_dst' == 0, the rest of the fields may
                                  * be uninitialized. */
+);
+
+/* Virtuoso fields */
+PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline3,
+    uint16_t fn_core;           /* Identifies fast-path core */
+    uint16_t flow_group;        /* Identifies flow group */
+    uint16_t vmid;              /* Keeps track of VM */
+    bool     rxpkt;             /* Determines if pkt from tx or rx queue*/
+    uint64_t connaddr;          /* Keeps track of async completion
+                                   information. This is an address local to Virtuoso
+                                   and should not be accessed here. We need this to
+                                   keep track of completion information when the
+                                   ovs upcall returns to Virtuoso. */
 );
 };
 

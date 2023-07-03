@@ -38,6 +38,11 @@ struct virtuosorx_class {
   struct netdev_class netdev_class;
 };
 
+static int
+netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch);
+static int
+netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch);
+
 bool 
 netdev_virtuosorx_is_virtuosorx_class(const struct netdev_class *class)
 {
@@ -337,6 +342,24 @@ static int
 netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED, 
                            struct dp_packet_batch *batch, int *qfill OVS_UNUSED)
 {
+  int retrx, rettx;
+  dp_packet_batch_init(batch);
+ 
+  /* Get incoming packets from Virtuoso */
+  retrx = netdev_virtuosorx_rxq_recvrx(batch);
+
+  /* Get outgoing packets from Virtuoso */
+  rettx = netdev_virtuosorx_rxq_recvtx(batch);
+
+  if (retrx ==  EAGAIN && rettx == EAGAIN)
+    return EAGAIN;
+
+  return 0;
+}
+
+static int
+netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
+{
   int mtu;
   uint16_t len;
   struct dp_packet *pkt;
@@ -359,7 +382,7 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
     return EAGAIN;
   }
 
-  VLOG_INFO("Got kernel message from Virtuoso");
+  VLOG_INFO("Got kernel message from Virtuoso RX");
   VLOG_INFO("fn_core=%d addr=%ld len=%d", toe->msg.packet.fn_core, toe->addr, toe->msg.packet.len);
   /* Get packet from shm */
   len = toe->msg.packet.len;
@@ -379,8 +402,6 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   
   /* Add packet to datapath batch */
   mtu = ETH_PAYLOAD_MAX;
-  dp_packet_batch_init(batch);
-
   pkt = dp_packet_new_with_headroom(len + mtu, DP_NETDEV_HEADROOM);
   VLOG_INFO("Packet size before adding data or anything = %d", dp_packet_size(pkt));
   memcpy(dp_packet_data(pkt), virtuoso_buf, len);
@@ -395,6 +416,8 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   dp_packet_set_size(pkt, len);
   pkt->md.flow_group = toe->msg.packet.flow_group;
   pkt->md.fn_core = toe->msg.packet.fn_core;
+  pkt->md.vmid = toe->msg.packet.vmid;
+  pkt->md.rxpkt = true;
   VLOG_INFO("Packet size after set size = %d", dp_packet_size(pkt));
   // pkt->packet_type = htonl(PT_ETH);
   // pkt = netdev_gre_pop_header(pkt);
@@ -402,6 +425,88 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
   tasovs->rx_tail = tasovs->rx_tail + 1;
   if (tasovs->rx_tail == info->nic_rx_len)
     tasovs->rx_tail -= info->nic_rx_len;
+
+  toe->type = 0;
+  
+  if (!pkt)
+  {
+    VLOG_WARN("Failed to pop GRE header");
+    return EAGAIN;  
+  }
+  
+  dp_packet_batch_add(batch, pkt);
+  return 0;
+}
+
+static int
+netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
+{
+  int mtu;
+  uint16_t len;
+  struct dp_packet *pkt;
+  volatile struct flextcp_pl_ovsctx *tasovs = &fp_state->tasovs;
+  volatile struct flextcp_pl_toe *toe;
+  void *virtuoso_buf;
+  uintptr_t addr;
+  uint8_t type;
+
+  addr = tasovs->tx_base + tasovs->tx_tail;
+  len = sizeof(*toe);
+
+  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
+  toe = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+
+  /* Kernel queue empty so do nothing */
+  type = toe->type;
+  if (type == FLEXTCP_PL_TOE_INVALID)
+  {
+    return EAGAIN;
+  }
+
+  VLOG_INFO("Got kernel message from Virtuoso TX");
+  VLOG_INFO("fn_core=%d addr=%ld len=%d", toe->msg.packet.fn_core, toe->addr, toe->msg.packet.len);
+  /* Get packet from shm */
+  len = toe->msg.packet.len;
+  virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] + toe->addr);
+
+  struct eth_hdr *eth = virtuoso_buf;
+  struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
+  struct gre_hdr *gre = (struct gre_hdr *)(out_ip + 1);
+  struct ip_hdr *in_ip = (struct ip_hdr *)(gre + 1);
+  struct tcp_hdr *tcp = (struct tcp_hdr *)(in_ip + 1);
+  VLOG_INFO("printing actual packet data: version=%d len=%d outerip_src=%08x outerip_dst=%08x", 
+      IPH_V(out_ip), len,f_beui32(out_ip->src), f_beui32(out_ip->dest));
+  VLOG_INFO("printing actual packet data: version=%d innerip_src=%08x innerip_dst=%08x", 
+      IPH_V(in_ip), f_beui32(in_ip->src), f_beui32(in_ip->dest));
+  VLOG_INFO("printing actual packet data: tun_id=%d tcp_src=%05u tcp_dst=%05u", 
+      f_beui32(gre->key), f_beui16(tcp->src), f_beui16(tcp->dest));
+  
+  /* Add packet to datapath batch */
+  mtu = ETH_PAYLOAD_MAX;
+  pkt = dp_packet_new_with_headroom(len + mtu, DP_NETDEV_HEADROOM);
+  VLOG_INFO("Packet size before adding data or anything = %d", dp_packet_size(pkt));
+  memcpy(dp_packet_data(pkt), virtuoso_buf, len);
+  // eth = dp_packet_data(pkt);
+  // out_ip = (struct ip_hdr *)(eth + 1);
+  // gre = (struct gre_hdr *)(out_ip + 1);
+  // in_ip = (struct ip_hdr *)(gre + 1);
+  // tcp = (struct tcp_hdr *)(in_ip + 1);
+  // dp_packet_set_l3(pkt, out_ip);
+  // dp_packet_set_l4(pkt, gre);
+  VLOG_INFO("Packet size after copying data = %d", dp_packet_size(pkt));
+  dp_packet_set_size(pkt, len);
+  pkt->md.flow_group = toe->msg.packet.flow_group;
+  pkt->md.fn_core = toe->msg.packet.fn_core;
+  pkt->md.vmid = toe->msg.packet.vmid;
+  pkt->md.connaddr = toe->msg.packet.connaddr;
+  pkt->md.rxpkt = false;
+  VLOG_INFO("Packet size after set size = %d", dp_packet_size(pkt));
+  // pkt->packet_type = htonl(PT_ETH);
+  // pkt = netdev_gre_pop_header(pkt);
+
+  tasovs->tx_tail = tasovs->tx_tail + 1;
+  if (tasovs->tx_tail == info->nic_rx_len)
+    tasovs->tx_tail -= info->nic_tx_len;
 
   toe->type = 0;
   

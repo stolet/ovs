@@ -40,6 +40,20 @@ struct virtuosotx_class {
   struct netdev_class netdev_class;
 };
 
+static int netdev_virtuosotx_sendrx(struct dp_packet *pkt);
+static int netdev_virtuosotx_sendtx(struct dp_packet *pkt);
+int util_parse_ipv4(const char *s, uint32_t *ip);
+
+int 
+util_parse_ipv4(const char *s, uint32_t *ip)
+{
+  if (inet_pton(AF_INET, s, ip) != 1) {
+    return -1;
+  }
+  *ip = htonl(*ip);
+  return 0;
+}
+
 bool 
 netdev_virtuosotx_is_virtuoso_class(const struct netdev_class *class)
 {
@@ -315,52 +329,120 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
                        struct dp_packet_batch *batch OVS_UNUSED,
                        bool concurrent_txq OVS_UNUSED)
 {
+  int ret;
   int packet_drops = 0;
-  uint16_t len;
   struct netdev_virtuosotx *netdev = netdev_virtuosotx_cast(netdev_);
-  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
-  volatile struct flextcp_pl_ote *ote;
   struct dp_packet *pkt;
-  uintptr_t addr;
-  void *buf_addr;
+
 
   ovs_mutex_lock(&netdev->tx_mutex);
   DP_PACKET_BATCH_FOR_EACH(i, pkt, batch)
   {
-    addr = ovstas->rx_base + netdev->tx_head;
-    len = sizeof(*ote);
-
-    ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-    ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
-
-    if (ote->type != 0) {
-      packet_drops++;
-      continue;
+    if (pkt->md.rxpkt)
+    {
+      ret = netdev_virtuosotx_sendrx(pkt);
+    } else 
+    {
+      ret = netdev_virtuosotx_sendtx(pkt);
     }
 
-    ovstas->rx_head += sizeof(*ote);
-    if (ovstas->rx_head >= ovstas->rx_len)
-      ovstas->rx_head -= ovstas->rx_len;
-
-    len = dp_packet_size(pkt);
-    buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
-    rte_memcpy(buf_addr, dp_packet_data(pkt), len);
-
-    ote->msg.packet.len = len;
-    ote->msg.packet.flow_group = pkt->md.flow_group;
-    ote->msg.packet.fn_core = pkt->md.fn_core;
-    MEM_BARRIER();
-
-    ote->type = FLEXTCP_PL_OTE_VALID;
+    if (ret < 0)
+      packet_drops++;
   }
+  ovs_mutex_unlock(&netdev->tx_mutex);
 
   if (packet_drops > 0)
   {
-    ovs_mutex_unlock(&netdev->tx_mutex);
     return packet_drops;
   }
 
-  ovs_mutex_unlock(&netdev->tx_mutex);
+  return 0;
+}
+
+static int
+netdev_virtuosotx_sendrx(struct dp_packet *pkt)
+{
+  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
+  volatile struct flextcp_pl_ote *ote;
+  uintptr_t addr;
+  void *buf_addr;
+  uint16_t len;
+
+  addr = ovstas->rx_base + ovstas->rx_head;
+  len = sizeof(*ote);
+
+  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
+  ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+
+  if (ote->type != 0)
+    return -1;
+
+  ovstas->rx_head += sizeof(*ote);
+  if (ovstas->rx_head >= ovstas->rx_len)
+    ovstas->rx_head -= ovstas->rx_len;
+
+  len = dp_packet_size(pkt);
+  buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
+  rte_memcpy(buf_addr, dp_packet_data(pkt), len);
+
+  ote->msg.packet.len = len;
+  ote->msg.packet.flow_group = pkt->md.flow_group;
+  ote->msg.packet.fn_core = pkt->md.fn_core;
+  MEM_BARRIER();
+
+  ote->type = FLEXTCP_PL_OTE_VALID;
+
+  return 0;
+}
+
+static int
+netdev_virtuosotx_sendtx(struct dp_packet *pkt)
+{
+  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
+  volatile struct flextcp_pl_ote *ote;
+  uintptr_t addr;
+  void *buf_addr;
+  uint16_t len;
+
+  
+  addr = ovstas->tx_base + ovstas->tx_head;
+  len = sizeof(*ote);
+
+  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
+  ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+
+  if (ote->type != 0) 
+    return -1;
+
+  ovstas->tx_head += sizeof(*ote);
+  if (ovstas->tx_head >= ovstas->tx_len)
+    ovstas->tx_head -= ovstas->tx_len;
+
+
+  struct eth_hdr *eth = dp_packet_data(pkt);
+  struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
+  struct gre_hdr *gre = (struct gre_hdr *)(out_ip + 1);
+  struct ip_hdr *in_ip = (struct ip_hdr *)(gre + 1);
+
+  uint32_t in_lip;
+  uint32_t out_rip; 
+  util_parse_ipv4("192.168.10.14", &out_rip);
+  util_parse_ipv4("10.0.0.20", &in_lip);
+  gre->key = t_beui32(1);
+  out_ip->dest = t_beui32(out_rip);
+  in_ip->src = t_beui32(in_lip);
+  len = dp_packet_size(pkt);
+  buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
+  rte_memcpy(buf_addr, dp_packet_data(pkt), len);
+
+  ote->msg.packet.len = len;
+  ote->msg.packet.flow_group = pkt->md.flow_group;
+  ote->msg.packet.fn_core = pkt->md.fn_core;
+  ote->msg.packet.connaddr = pkt->md.connaddr;
+  MEM_BARRIER();
+
+  ote->type = FLEXTCP_PL_OTE_VALID;
+
   return 0;
 }
 
@@ -369,18 +451,6 @@ netdev_virtuosotx_send_wait(struct netdev *netdev OVS_UNUSED, int qid OVS_UNUSED
 {
   
 }
-
-// static const struct netdev_tunnel_config *
-// vport_tunnel_config(struct netdev_vport *netdev)
-// {
-//     return ovsrcu_get(const struct netdev_tunnel_config *, &netdev->tnl_cfg);
-// }
-
-// static const struct netdev_tunnel_config *
-// get_netdev_tunnel_config(const struct netdev *netdev)
-// {
-//     return vport_tunnel_config(netdev_vport_cast(netdev));
-// }
 
 #define NETDEV_VIRTUOSO_COMMON_FUNCTIONS                     \
   .run = netdev_virtuosotx_run,                              \
