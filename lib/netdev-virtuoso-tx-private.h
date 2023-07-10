@@ -2,6 +2,7 @@
 #define NETDEV_VIRTUOSO_PRIVATE_H 1
 
 #include <stdbool.h>
+#include <netinet/in.h>
 
 #include "netdev-provider.h"
 #include "netdev.h"
@@ -14,8 +15,17 @@ struct netdev_virtuosotx {
 
   /* Protects all members below. */
   struct ovs_mutex mutex;
+  volatile void **shms;
+  volatile struct flexnic_info *info;
+  volatile struct flextcp_pl_mem *fp_state;
   struct eth_addr etheraddr;
   struct netdev_stats stats;
+  uint16_t vmid;
+  ovs_be32 gre_key;
+  struct in_addr out_remote_ip;
+  struct in_addr out_local_ip;
+  struct in_addr in_remote_ip;
+  struct in_addr in_local_ip;
 };
 
 int netdev_virtuosotx_construct(struct netdev *);

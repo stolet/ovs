@@ -22,13 +22,11 @@
 #include "netdev-native-tnl.h"
 #include "ovs-rcu.h"
 #include "openvswitch/vlog.h"
+#include "smap.h"
+#include "socket-util.h"
 
 
 VLOG_DEFINE_THIS_MODULE(netdev_virtuosotx);
-
-volatile void **shms = NULL;
-volatile struct flexnic_info *info;
-volatile struct flextcp_pl_mem *fp_state;
 
 enum tunnel_layers {
     TNL_L2 = 1 << 0,       /* 1 if a tunnel type can carry Ethernet traffic. */
@@ -40,9 +38,16 @@ struct virtuosotx_class {
   struct netdev_class netdev_class;
 };
 
-static int netdev_virtuosotx_sendrx(struct dp_packet *pkt);
-static int netdev_virtuosotx_sendtx(struct dp_packet *pkt);
-int util_parse_ipv4(const char *s, uint32_t *ip);
+static int 
+netdev_virtuosotx_sendrx(struct netdev_virtuosotx *dev, struct dp_packet *pkt);
+static int 
+netdev_virtuosotx_sendtx(struct netdev_virtuosotx *dev, struct dp_packet *pkt);
+static int 
+parse_ip(const char *value, struct in_addr *ip);
+static ovs_be32 
+parse_key(const struct smap *args, const char *name);
+int 
+util_parse_ipv4(const char *s, uint32_t *ip);
 
 int 
 util_parse_ipv4(const char *s, uint32_t *ip)
@@ -152,7 +157,7 @@ netdev_virtuosotx_construct(struct netdev *netdev_)
   eth_addr_random(&dev->etheraddr);
 
   /* return error, if already connected */
-  if (info != NULL) 
+  if (dev->info != NULL) 
   {
     VLOG_ERR( "netdev_virtuosotx_construct: already mapped\n");
     return -1;
@@ -194,7 +199,7 @@ netdev_virtuosotx_construct(struct netdev *netdev_)
 
 
   /* open and map all dma shm region */
-  if ((shms = malloc((FLEXNIC_PL_VMST_NUM + 1) * sizeof(void *))) == NULL) 
+  if ((dev->shms = malloc((FLEXNIC_PL_VMST_NUM + 1) * sizeof(void *))) == NULL) 
   {
     VLOG_ERR("netdev_virtuosotx_construct: failed to malloc handles for shm");
     goto error_unmap_fp_state;
@@ -221,11 +226,11 @@ netdev_virtuosotx_construct(struct netdev *netdev_)
     }
 
     m_shm[i] = m;
-    shms[i] = m;
+    dev->shms[i] = m;
   }
 
-  info = fi;
-  fp_state = fs;
+  dev->info = fi;
+  dev->fp_state = fs;
 
   return 0;
 
@@ -251,14 +256,14 @@ netdev_virtuosotx_destruct(struct netdev *netdev_)
   /* Unmap shared memory region for each VM and slow path */
   for (i = 0; i < FLEXNIC_PL_VMST_NUM + 1; i++)
   {
-    munmap((void *) shms[i], info->dma_mem_size);
+    munmap((void *) netdev->shms[i], netdev->info->dma_mem_size);
   }
   
   /* Unmap shared memory region for internal state */
-  munmap((void *) fp_state, info->internal_mem_size);
+  munmap((void *) netdev->fp_state, netdev->info->internal_mem_size);
 
   /* Unmap virtuoso info */
-  munmap((void *) info, FLEXNIC_INFO_BYTES);
+  munmap((void *) netdev->info, FLEXNIC_INFO_BYTES);
 }
 
 static void 
@@ -310,6 +315,108 @@ netdev_virtuosotx_update_flags(struct netdev *netdev OVS_UNUSED,
     return 0;
 }
 
+static int 
+netdev_virtuosotx_set_config(struct netdev *dev_, const struct smap *args, char **errp)
+{
+  struct netdev_virtuosotx *dev = netdev_virtuosotx_cast(dev_);
+  const char *name = netdev_get_name(dev_);
+  const char *type = netdev_get_type(dev_);
+  struct ds errors = DS_EMPTY_INITIALIZER;
+  struct smap_node *node;
+  int err = 0;
+
+  SMAP_FOR_EACH (node, args)
+  {
+    if (!strcmp(node->key, "out_remote_ip"))
+    {
+      err = parse_ip(node->value, &dev->out_remote_ip);
+      switch (err) 
+      {
+      case ENOENT:
+        ds_put_format(&errors, "%s: bad %s 'out_remote_ip'\n", name, type);
+        break;
+      case EINVAL:
+        ds_put_format(&errors,
+                      "%s: multicast out_remote_ip=%s not allowed\n",
+                      name, node->value);
+        goto out;
+      }
+    } else if (!strcmp(node->key, "out_local_ip"))
+    {
+      err = parse_ip(node->value, &dev->out_local_ip);
+      switch (err) 
+      {
+      case ENOENT:
+        ds_put_format(&errors, "%s: bad %s 'out_local_ip'\n", name, type);
+        break;
+      case EINVAL:
+        ds_put_format(&errors,
+                      "%s: multicast out_local_ip=%s not allowed\n",
+                      name, node->value);
+        goto out;
+      }
+    } else if (!strcmp(node->key, "in_remote_ip"))
+    {
+      err = parse_ip(node->value, &dev->in_remote_ip);
+      switch (err) 
+      {
+      case ENOENT:
+        ds_put_format(&errors, "%s: bad %s 'in_remote_ip'\n", name, type);
+        break;
+      case EINVAL:
+        ds_put_format(&errors,
+                      "%s: multicast in_remote_ip=%s not allowed\n",
+                      name, node->value);
+        goto out;
+      }
+    } else if (!strcmp(node->key, "in_local_ip"))
+    {
+      err = parse_ip(node->value, &dev->in_local_ip);
+      switch (err) 
+      {
+      case ENOENT:
+        ds_put_format(&errors, "%s: bad %s 'in_local_ip'\n", name, type);
+        break;
+      case EINVAL:
+        ds_put_format(&errors,
+                      "%s: multicast in_local_ip=%s not allowed\n",
+                      name, node->value);
+        goto out;
+      }
+    }
+  }
+
+  dev->gre_key = parse_key(args, "key");
+
+  if (dev->gre_key == 0)
+    goto out;
+
+  return 0;
+
+out:
+    if (errors.length) {
+        ds_chomp(&errors, '\n');
+        VLOG_WARN("%s", ds_cstr(&errors));
+        if (err) {
+            *errp = ds_steal_cstr(&errors);
+        }
+    }
+
+    ds_destroy(&errors);
+
+    return err;
+}
+
+static int
+netdev_virtuosotx_get_config(const struct netdev *dev_, struct smap *args)
+{
+  struct netdev_virtuosotx *dev = netdev_virtuosotx_cast(dev_);
+  const char *name = netdev_get_name(dev_);
+  const char *type = netdev_get_type(dev_);
+
+  return 0;
+}
+
 /* Performs periodic work needed by Virtuoso */
 static void
 netdev_virtuosotx_run(const struct netdev_class *netdev_class OVS_UNUSED)
@@ -325,7 +432,7 @@ netdev_virtuosotx_wait(const struct netdev_class *netdev_class OVS_UNUSED)
 }
 
 static int
-netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
+netdev_virtuosotx_send(struct netdev *netdev_, int qid OVS_UNUSED,
                        struct dp_packet_batch *batch OVS_UNUSED,
                        bool concurrent_txq OVS_UNUSED)
 {
@@ -340,10 +447,10 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
   {
     if (pkt->md.rxpkt)
     {
-      ret = netdev_virtuosotx_sendrx(pkt);
+      ret = netdev_virtuosotx_sendrx(netdev, pkt);
     } else 
     {
-      ret = netdev_virtuosotx_sendtx(pkt);
+      ret = netdev_virtuosotx_sendtx(netdev, pkt);
     }
 
     if (ret < 0)
@@ -360,19 +467,22 @@ netdev_virtuosotx_send(struct netdev *netdev_ OVS_UNUSED, int qid OVS_UNUSED,
 }
 
 static int
-netdev_virtuosotx_sendrx(struct dp_packet *pkt)
+netdev_virtuosotx_sendrx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
 {
-  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
+  volatile struct flextcp_pl_ovsctx *ovstas = &dev->fp_state->ovstas;
   volatile struct flextcp_pl_ote *ote;
   uintptr_t addr;
   void *buf_addr;
   uint16_t len;
 
+  VLOG_INFO("Got RX pkt: tun_src=%08x tun_dst=%08x tun_id=%d",
+    ntohl(pkt->md.tunnel.ip_src), ntohl(pkt->md.tunnel.ip_dst), ntohl(pkt->md.tunnel.tun_id));
+
   addr = ovstas->rx_base + ovstas->rx_head;
   len = sizeof(*ote);
 
-  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  ote = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   if (ote->type != 0)
     return -1;
@@ -382,7 +492,7 @@ netdev_virtuosotx_sendrx(struct dp_packet *pkt)
     ovstas->rx_head -= ovstas->rx_len;
 
   len = dp_packet_size(pkt);
-  buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
+  buf_addr = (uint8_t *) dev->shms[SP_MEM_ID] + ote->addr;
   rte_memcpy(buf_addr, dp_packet_data(pkt), len);
 
   ote->msg.packet.len = len;
@@ -396,20 +506,22 @@ netdev_virtuosotx_sendrx(struct dp_packet *pkt)
 }
 
 static int
-netdev_virtuosotx_sendtx(struct dp_packet *pkt)
+netdev_virtuosotx_sendtx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
 {
-  volatile struct flextcp_pl_ovsctx *ovstas = &fp_state->ovstas;
+  volatile struct flextcp_pl_ovsctx *ovstas = &dev->fp_state->ovstas;
   volatile struct flextcp_pl_ote *ote;
   uintptr_t addr;
   void *buf_addr;
   uint16_t len;
 
+  VLOG_INFO("Got TX pkt: tun_src=%08x tun_dst=%08x tun_id=%d",
+    ntohl(pkt->md.tunnel.ip_src), ntohl(pkt->md.tunnel.ip_dst), ntohl(pkt->md.tunnel.tun_id));
   
   addr = ovstas->tx_base + ovstas->tx_head;
   len = sizeof(*ote);
 
-  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  ote = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  ote = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   if (ote->type != 0) 
     return -1;
@@ -432,7 +544,7 @@ netdev_virtuosotx_sendtx(struct dp_packet *pkt)
   out_ip->dest = t_beui32(out_rip);
   in_ip->src = t_beui32(in_lip);
   len = dp_packet_size(pkt);
-  buf_addr = (uint8_t *) shms[SP_MEM_ID] + ote->addr;
+  buf_addr = (uint8_t *) dev->shms[SP_MEM_ID] + ote->addr;
   rte_memcpy(buf_addr, dp_packet_data(pkt), len);
 
   ote->msg.packet.len = len;
@@ -444,6 +556,35 @@ netdev_virtuosotx_sendtx(struct dp_packet *pkt)
   ote->type = FLEXTCP_PL_OTE_VALID;
 
   return 0;
+}
+
+static int
+parse_ip(const char *value, struct in_addr *ip)
+{
+
+  if (lookup_ip(value, ip))
+  {
+    return ENOENT;
+  }
+
+  return 0;
+}
+
+static ovs_be32
+parse_key(const struct smap *args, const char *name)
+{
+  const char *s;
+  s = smap_get(args, name);
+  if (!s)
+  {
+    s = smap_get(args, "key");
+    if (!s)
+    {
+      return 0;
+    }
+  }
+
+  return htonl(strtoul(s, NULL, 0));
 }
 
 static void
@@ -462,9 +603,11 @@ netdev_virtuosotx_send_wait(struct netdev *netdev OVS_UNUSED, int qid OVS_UNUSED
   .set_etheraddr = netdev_virtuosotx_set_etheraddr,          \
   .get_etheraddr = netdev_virtuosotx_get_etheraddr,          \
   .update_flags = netdev_virtuosotx_update_flags,            \
+  .set_config = netdev_virtuosotx_set_config,                \
+  .get_config = netdev_virtuosotx_get_config,                \
   .build_header = netdev_gre_build_header,                   \
   .pop_header = netdev_gre_pop_header,                       \
-  .push_header = netdev_gre_push_header                     
+  .push_header = netdev_gre_push_header                      
 
 #define NETDEV_VIRTUOSO_SEND_FUNCTIONS                       \
   .send = netdev_virtuosotx_send,                            \

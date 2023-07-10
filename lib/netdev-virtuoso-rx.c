@@ -298,6 +298,7 @@ netdev_virtuosorx_update_flags(struct netdev *netdev OVS_UNUSED,
     return 0;
 }
 
+
 /* Performs periodic work needed by Virtuoso */
 static void
 netdev_virtuosorx_run(const struct netdev_class *netdev_class OVS_UNUSED)
@@ -484,25 +485,22 @@ netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
   /* Add packet to datapath batch */
   mtu = ETH_PAYLOAD_MAX;
   pkt = dp_packet_new_with_headroom(len + mtu, DP_NETDEV_HEADROOM);
-  VLOG_INFO("Packet size before adding data or anything = %d", dp_packet_size(pkt));
   memcpy(dp_packet_data(pkt), virtuoso_buf, len);
-  // eth = dp_packet_data(pkt);
-  // out_ip = (struct ip_hdr *)(eth + 1);
-  // gre = (struct gre_hdr *)(out_ip + 1);
-  // in_ip = (struct ip_hdr *)(gre + 1);
-  // tcp = (struct tcp_hdr *)(in_ip + 1);
+  dp_packet_set_size(pkt, len);
+  eth = dp_packet_data(pkt);
+  out_ip = (struct ip_hdr *)(eth + 1);
+  gre = (struct gre_hdr *)(out_ip + 1);
+  in_ip = (struct ip_hdr *)(gre + 1);
+  tcp = (struct tcp_hdr *)(in_ip + 1);
   // dp_packet_set_l3(pkt, out_ip);
   // dp_packet_set_l4(pkt, gre);
-  VLOG_INFO("Packet size after copying data = %d", dp_packet_size(pkt));
-  dp_packet_set_size(pkt, len);
+  // pkt->packet_type = htonl(PT_ETH);
+  // pkt = netdev_gre_pop_header(pkt);
   pkt->md.flow_group = toe->msg.packet.flow_group;
   pkt->md.fn_core = toe->msg.packet.fn_core;
   pkt->md.vmid = toe->msg.packet.vmid;
   pkt->md.connaddr = toe->msg.packet.connaddr;
   pkt->md.rxpkt = false;
-  VLOG_INFO("Packet size after set size = %d", dp_packet_size(pkt));
-  // pkt->packet_type = htonl(PT_ETH);
-  // pkt = netdev_gre_pop_header(pkt);
 
   tasovs->tx_tail = tasovs->tx_tail + 1;
   if (tasovs->tx_tail == info->nic_rx_len)

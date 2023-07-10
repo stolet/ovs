@@ -5331,15 +5331,6 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
     error = netdev_rxq_recv(rxq->rx, &batch, qlen_p);
     if (!error) {
         /* At least one packet received. */
-        VLOG_INFO("dp_netdev_process_rxq_port: portno=%d name=%s type=%s", 
-            port_no, rxq->port->netdev->name, rxq->port->type);
-        if (flow_tnl_dst_is_set(&batch.packets[0]->md.tunnel))
-        {
-            VLOG_INFO("dp_netdev_process_rxq_port: first packet tun_id=%ld src=%08x dst=%08x", 
-                batch.packets[0]->md.tunnel.tun_id, 
-                ntohl(batch.packets[0]->md.tunnel.ip_src), 
-                ntohl(batch.packets[0]->md.tunnel.ip_dst));
-        }
         *recirc_depth_get() = 0;
         pmd_thread_ctx_time_update(pmd);
         batch_cnt = dp_packet_batch_size(&batch);
