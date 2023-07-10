@@ -24,10 +24,6 @@
 
 VLOG_DEFINE_THIS_MODULE(netdev_virtuosorx);
 
-static volatile void **shms = NULL;
-static volatile struct flexnic_info *info;
-static volatile struct flextcp_pl_mem *fp_state;
-
 enum tunnel_layers {
     TNL_L2 = 1 << 0,       /* 1 if a tunnel type can carry Ethernet traffic. */
     TNL_L3 = 1 << 1        /* 1 if a tunnel type can carry L3 traffic. */
@@ -39,9 +35,11 @@ struct virtuosorx_class {
 };
 
 static int
-netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch);
+netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev, 
+    struct dp_packet_batch *batch);
 static int
-netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch);
+netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
+    struct dp_packet_batch *batch);
 
 bool 
 netdev_virtuosorx_is_virtuosorx_class(const struct netdev_class *class)
@@ -140,7 +138,7 @@ netdev_virtuosorx_construct(struct netdev *netdev_)
   eth_addr_random(&dev->etheraddr);
 
   /* return error, if already connected */
-  if (info != NULL) 
+  if (dev->info != NULL) 
   {
     VLOG_ERR( "netdev_virtuosorx_construct: already mapped\n");
     return -1;
@@ -182,7 +180,7 @@ netdev_virtuosorx_construct(struct netdev *netdev_)
 
 
   /* open and map all dma shm region */
-  if ((shms = malloc((FLEXNIC_PL_VMST_NUM + 1) * sizeof(void *))) == NULL) 
+  if ((dev->shms = malloc((FLEXNIC_PL_VMST_NUM + 1) * sizeof(void *))) == NULL) 
   {
     VLOG_ERR("netdev_virtuosorx_construct: failed to malloc handles for shm");
     goto error_unmap_fp_state;
@@ -209,11 +207,11 @@ netdev_virtuosorx_construct(struct netdev *netdev_)
     }
 
     m_shm[i] = m;
-    shms[i] = m;
+    dev->shms[i] = m;
   }
 
-  info = fi;
-  fp_state = fs;
+  dev->info = fi;
+  dev->fp_state = fs;
 
   return 0;
 
@@ -239,14 +237,14 @@ netdev_virtuosorx_destruct(struct netdev *netdev_)
   /* Unmap shared memory region for each VM and slow path */
   for (i = 0; i < FLEXNIC_PL_VMST_NUM + 1; i++)
   {
-    munmap((void *) shms[i], info->dma_mem_size);
+    munmap((void *) netdev->shms[i], netdev->info->dma_mem_size);
   }
   
   /* Unmap shared memory region for internal state */
-  munmap((void *) fp_state, info->internal_mem_size);
+  munmap((void *) netdev->fp_state, netdev->info->internal_mem_size);
 
   /* Unmap virtuoso info */
-  munmap((void *) info, FLEXNIC_INFO_BYTES);
+  munmap((void *) netdev->info, FLEXNIC_INFO_BYTES);
 }
 
 static void 
@@ -344,13 +342,16 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
                            struct dp_packet_batch *batch, int *qfill OVS_UNUSED)
 {
   int retrx, rettx;
+  struct netdev_rxq_virtuosorx *rxq = netdev_rxq_virtuosorx_cast(rxq_);
+  struct netdev *netdev_ = rxq->up.netdev;
+  struct netdev_virtuosorx *netdev = netdev_virtuosorx_cast(netdev_);
   dp_packet_batch_init(batch);
  
   /* Get incoming packets from Virtuoso */
-  retrx = netdev_virtuosorx_rxq_recvrx(batch);
+  retrx = netdev_virtuosorx_rxq_recvrx(netdev, batch);
 
   /* Get outgoing packets from Virtuoso */
-  rettx = netdev_virtuosorx_rxq_recvtx(batch);
+  rettx = netdev_virtuosorx_rxq_recvtx(netdev, batch);
 
   if (retrx ==  EAGAIN && rettx == EAGAIN)
     return EAGAIN;
@@ -359,12 +360,13 @@ netdev_virtuosorx_rxq_recv(struct netdev_rxq *rxq_ OVS_UNUSED,
 }
 
 static int
-netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
+netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev, 
+    struct dp_packet_batch *batch)
 {
   int mtu;
   uint16_t len;
   struct dp_packet *pkt;
-  volatile struct flextcp_pl_ovsctx *tasovs = &fp_state->tasovs;
+  volatile struct flextcp_pl_ovsctx *tasovs = &dev->fp_state->tasovs;
   volatile struct flextcp_pl_toe *toe;
   void *virtuoso_buf;
   uintptr_t addr;
@@ -373,8 +375,8 @@ netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
   addr = tasovs->rx_base + tasovs->rx_tail;
   len = sizeof(*toe);
 
-  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  toe = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   /* Kernel queue empty so do nothing */
   type = toe->type;
@@ -387,7 +389,7 @@ netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
   VLOG_INFO("fn_core=%d addr=%ld len=%d", toe->msg.packet.fn_core, toe->addr, toe->msg.packet.len);
   /* Get packet from shm */
   len = toe->msg.packet.len;
-  virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] + toe->addr);
+  virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
 
   struct eth_hdr *eth = virtuoso_buf;
   struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
@@ -424,8 +426,8 @@ netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
   // pkt = netdev_gre_pop_header(pkt);
 
   tasovs->rx_tail = tasovs->rx_tail + 1;
-  if (tasovs->rx_tail == info->nic_rx_len)
-    tasovs->rx_tail -= info->nic_rx_len;
+  if (tasovs->rx_tail == dev->info->nic_rx_len)
+    tasovs->rx_tail -= dev->info->nic_rx_len;
 
   toe->type = 0;
   
@@ -440,12 +442,13 @@ netdev_virtuosorx_rxq_recvrx(struct dp_packet_batch *batch)
 }
 
 static int
-netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
+netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
+    struct dp_packet_batch *batch)
 {
   int mtu;
   uint16_t len;
   struct dp_packet *pkt;
-  volatile struct flextcp_pl_ovsctx *tasovs = &fp_state->tasovs;
+  volatile struct flextcp_pl_ovsctx *tasovs = &dev->fp_state->tasovs;
   volatile struct flextcp_pl_toe *toe;
   void *virtuoso_buf;
   uintptr_t addr;
@@ -454,8 +457,8 @@ netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
   addr = tasovs->tx_base + tasovs->tx_tail;
   len = sizeof(*toe);
 
-  ovs_assert(addr + len >= addr && addr + len <= info->dma_mem_size);
-  toe = (void *) ((uint8_t *) shms[SP_MEM_ID] + addr);
+  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   /* Kernel queue empty so do nothing */
   type = toe->type;
@@ -468,7 +471,7 @@ netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
   VLOG_INFO("fn_core=%d addr=%ld len=%d", toe->msg.packet.fn_core, toe->addr, toe->msg.packet.len);
   /* Get packet from shm */
   len = toe->msg.packet.len;
-  virtuoso_buf = (void *) ((uint8_t *) shms[SP_MEM_ID] + toe->addr);
+  virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
 
   struct eth_hdr *eth = virtuoso_buf;
   struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
@@ -503,8 +506,8 @@ netdev_virtuosorx_rxq_recvtx(struct dp_packet_batch *batch)
   pkt->md.rxpkt = false;
 
   tasovs->tx_tail = tasovs->tx_tail + 1;
-  if (tasovs->tx_tail == info->nic_rx_len)
-    tasovs->tx_tail -= info->nic_tx_len;
+  if (tasovs->tx_tail == dev->info->nic_rx_len)
+    tasovs->tx_tail -= dev->info->nic_tx_len;
 
   toe->type = 0;
   

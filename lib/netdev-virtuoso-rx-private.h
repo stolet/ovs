@@ -11,6 +11,9 @@ struct netdev_virtuosorx {
 
   /* Protects all members below. */
   struct ovs_mutex mutex;
+  volatile void **shms;
+  volatile struct flexnic_info *info;
+  volatile struct flextcp_pl_mem *fp_state;
   struct eth_addr etheraddr;
   struct netdev_stats stats;
 };
