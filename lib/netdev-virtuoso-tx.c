@@ -408,12 +408,9 @@ out:
 }
 
 static int
-netdev_virtuosotx_get_config(const struct netdev *dev_, struct smap *args)
+netdev_virtuosotx_get_config(const struct netdev *dev_ OVS_UNUSED, 
+    struct smap *args OVS_UNUSED)
 {
-  struct netdev_virtuosotx *dev = netdev_virtuosotx_cast(dev_);
-  const char *name = netdev_get_name(dev_);
-  const char *type = netdev_get_type(dev_);
-
   return 0;
 }
 
@@ -473,15 +470,12 @@ netdev_virtuosotx_sendrx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
   volatile struct flextcp_pl_ote *ote;
   uintptr_t addr;
   void *buf_addr;
-  uint16_t len;
-
-  VLOG_INFO("Got RX pkt: tun_src=%08x tun_dst=%08x tun_id=%d",
-    ntohl(pkt->md.tunnel.ip_src), ntohl(pkt->md.tunnel.ip_dst), ntohl(pkt->md.tunnel.tun_id));
+  uint16_t msg_len, pkt_len;
 
   addr = ovstas->rx_base + ovstas->rx_head;
-  len = sizeof(*ote);
+  msg_len = sizeof(*ote);
 
-  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
   ote = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   if (ote->type != 0)
@@ -491,13 +485,18 @@ netdev_virtuosotx_sendrx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
   if (ovstas->rx_head >= ovstas->rx_len)
     ovstas->rx_head -= ovstas->rx_len;
 
-  len = dp_packet_size(pkt);
+  pkt_len = dp_packet_size(pkt);
   buf_addr = (uint8_t *) dev->shms[SP_MEM_ID] + ote->addr;
-  rte_memcpy(buf_addr, dp_packet_data(pkt), len);
+  rte_memcpy(buf_addr, dp_packet_data(pkt), pkt_len);
 
-  ote->msg.packet.len = len;
+  ote->msg.packet.len = pkt_len;
   ote->msg.packet.flow_group = pkt->md.flow_group;
   ote->msg.packet.fn_core = pkt->md.fn_core;
+  ote->key = ntohl(dev->gre_key);
+  ote->out_remote_ip = ntohl(dev->out_remote_ip.s_addr);
+  ote->out_local_ip = ntohl(dev->out_local_ip.s_addr);
+  ote->in_remote_ip = ntohl(dev->in_remote_ip.s_addr);
+  ote->in_local_ip = ntohl(dev->in_local_ip.s_addr);
   MEM_BARRIER();
 
   ote->type = FLEXTCP_PL_OTE_VALID;
@@ -512,15 +511,12 @@ netdev_virtuosotx_sendtx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
   volatile struct flextcp_pl_ote *ote;
   uintptr_t addr;
   void *buf_addr;
-  uint16_t len;
+  uint16_t msg_len, pkt_len;
 
-  VLOG_INFO("Got TX pkt: tun_src=%08x tun_dst=%08x tun_id=%d",
-    ntohl(pkt->md.tunnel.ip_src), ntohl(pkt->md.tunnel.ip_dst), ntohl(pkt->md.tunnel.tun_id));
-  
   addr = ovstas->tx_base + ovstas->tx_head;
-  len = sizeof(*ote);
+  msg_len = sizeof(*ote);
 
-  ovs_assert(addr + len >= addr && addr + len <= dev->info->dma_mem_size);
+  ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
   ote = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
 
   if (ote->type != 0) 
@@ -530,27 +526,19 @@ netdev_virtuosotx_sendtx(struct netdev_virtuosotx *dev, struct dp_packet *pkt)
   if (ovstas->tx_head >= ovstas->tx_len)
     ovstas->tx_head -= ovstas->tx_len;
 
-
-  struct eth_hdr *eth = dp_packet_data(pkt);
-  struct ip_hdr *out_ip = (struct ip_hdr *)(eth + 1);
-  struct gre_hdr *gre = (struct gre_hdr *)(out_ip + 1);
-  struct ip_hdr *in_ip = (struct ip_hdr *)(gre + 1);
-
-  uint32_t in_lip;
-  uint32_t out_rip; 
-  util_parse_ipv4("192.168.10.14", &out_rip);
-  util_parse_ipv4("10.0.0.20", &in_lip);
-  gre->key = t_beui32(1);
-  out_ip->dest = t_beui32(out_rip);
-  in_ip->src = t_beui32(in_lip);
-  len = dp_packet_size(pkt);
+  pkt_len = dp_packet_size(pkt);
   buf_addr = (uint8_t *) dev->shms[SP_MEM_ID] + ote->addr;
-  rte_memcpy(buf_addr, dp_packet_data(pkt), len);
+  rte_memcpy(buf_addr, dp_packet_data(pkt), pkt_len);
 
-  ote->msg.packet.len = len;
+  ote->msg.packet.len = pkt_len;
   ote->msg.packet.flow_group = pkt->md.flow_group;
   ote->msg.packet.fn_core = pkt->md.fn_core;
   ote->msg.packet.connaddr = pkt->md.connaddr;
+  ote->key = ntohl(dev->gre_key);
+  ote->out_remote_ip = ntohl(dev->out_remote_ip.s_addr);
+  ote->out_local_ip = ntohl(dev->out_local_ip.s_addr);
+  ote->in_remote_ip = ntohl(dev->in_remote_ip.s_addr);
+  ote->in_local_ip = ntohl(dev->in_local_ip.s_addr);
   MEM_BARRIER();
 
   ote->type = FLEXTCP_PL_OTE_VALID;
@@ -618,4 +606,5 @@ const struct netdev_class netdev_virtuosotx_class = {
   NETDEV_VIRTUOSO_COMMON_FUNCTIONS,
   NETDEV_VIRTUOSO_SEND_FUNCTIONS,
   .type = "virtuosotx",
+  .is_pmd = true,
 };

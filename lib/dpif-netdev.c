@@ -8709,8 +8709,6 @@ dp_execute_output_action(struct dp_netdev_pmd_thread *pmd,
     struct tx_port *p = pmd_send_port_cache_lookup(pmd, port_no);
     struct dp_packet_batch out;
     
-    VLOG_INFO("dp_execute_output_action sending to port %d for netdev %s", 
-            p->port->port_no, p->port->netdev->name);
     if (!OVS_LIKELY(p)) {
         COVERAGE_ADD(datapath_drop_invalid_port,
                      dp_packet_batch_size(packets_));
@@ -8807,7 +8805,6 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     struct tx_port *p;
     uint32_t packet_count, packets_dropped;
 
-    VLOG_INFO("dp_execute_cb action_type=%d", type);
     switch ((enum ovs_action_attr)type) {
     case OVS_ACTION_ATTR_OUTPUT:
         dp_execute_output_action(pmd, packets_, should_steal,
@@ -9127,7 +9124,6 @@ dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
                           const struct nlattr *actions, size_t actions_len)
 {
     struct dp_netdev_execute_aux aux = { pmd, flow };
-    VLOG_INFO("dp_netdev_execute_actions");
     odp_execute_actions(&aux, packets, should_steal, actions,
                         actions_len, dp_execute_cb);
 }
