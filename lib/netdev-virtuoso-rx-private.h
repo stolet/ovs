@@ -6,6 +6,9 @@
 #include "netdev-provider.h"
 #include "netdev.h"
 
+#define RX_BATCH_SIZE 6
+#define TX_BATCH_SIZE 6
+
 struct netdev_virtuosorx {
   struct netdev up;
 

@@ -362,7 +362,7 @@ static int
 netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev, 
     struct dp_packet_batch *batch)
 {
-  int mtu;
+  int mtu, i;
   uint16_t msg_len, pkt_len;
   struct dp_packet *pkt;
   volatile struct flextcp_pl_ovsctx *tasovs = &dev->fp_state->tasovs;
@@ -371,41 +371,46 @@ netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev,
   uintptr_t addr;
   uint8_t type;
 
-  addr = tasovs->rx_base + tasovs->rx_tail;
-  msg_len = sizeof(*toe);
-
-  ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
-  toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
-
-  /* Kernel queue empty so do nothing */
-  type = toe->type;
-  if (type == FLEXTCP_PL_TOE_INVALID)
+  mtu = ETH_PAYLOAD_MAX;
+  for (i = 0; i < RX_BATCH_SIZE; i++)
   {
-    return EAGAIN;
+    addr = tasovs->rx_base + tasovs->rx_tail;
+    msg_len = sizeof(*toe);
+
+    ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
+    toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
+
+    /* Kernel queue empty so do nothing */
+    type = toe->type;
+    if (type == FLEXTCP_PL_TOE_INVALID)
+      break;
+
+    /* Get packet from shm */
+    pkt_len = toe->msg.packet.len;
+    virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
+    
+    /* Add packet to datapath batch */
+    pkt = dp_packet_new_with_headroom(pkt_len + mtu, DP_NETDEV_HEADROOM);
+    memcpy(dp_packet_data(pkt), virtuoso_buf, pkt_len);
+    dp_packet_set_size(pkt, pkt_len);
+
+    pkt->md.flow_group = toe->msg.packet.flow_group;
+    pkt->md.fn_core = toe->msg.packet.fn_core;
+    pkt->md.vmid = toe->msg.packet.vmid;
+    pkt->md.rxpkt = true;
+
+    tasovs->rx_tail += sizeof(*toe);
+    if (tasovs->rx_tail >= tasovs->rx_len)
+      tasovs->rx_tail -= tasovs->rx_len;
+
+    toe->type = 0;
+    
+    dp_packet_batch_add(batch, pkt);
   }
 
-  /* Get packet from shm */
-  pkt_len = toe->msg.packet.len;
-  virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
-  
-  /* Add packet to datapath batch */
-  mtu = ETH_PAYLOAD_MAX;
-  pkt = dp_packet_new_with_headroom(pkt_len + mtu, DP_NETDEV_HEADROOM);
-  memcpy(dp_packet_data(pkt), virtuoso_buf, pkt_len);
-  dp_packet_set_size(pkt, pkt_len);
+  if (i == 0)
+    return EAGAIN;
 
-  pkt->md.flow_group = toe->msg.packet.flow_group;
-  pkt->md.fn_core = toe->msg.packet.fn_core;
-  pkt->md.vmid = toe->msg.packet.vmid;
-  pkt->md.rxpkt = true;
-
-  tasovs->rx_tail += sizeof(*toe);
-  if (tasovs->rx_tail >= tasovs->rx_len)
-    tasovs->rx_tail -= tasovs->rx_len;
-
-  toe->type = 0;
-  
-  dp_packet_batch_add(batch, pkt);
   return 0;
 }
 
@@ -413,7 +418,7 @@ static int
 netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
     struct dp_packet_batch *batch)
 {
-  int mtu;
+  int mtu, i;
   uint16_t msg_len, pkt_len;
   struct dp_packet *pkt;
   volatile struct flextcp_pl_ovsctx *tasovs = &dev->fp_state->tasovs;
@@ -422,42 +427,47 @@ netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
   uintptr_t addr;
   uint8_t type;
 
-  addr = tasovs->tx_base + tasovs->tx_tail;
-  msg_len = sizeof(*toe);
-
-  ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
-  toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
-
-  /* Kernel queue empty so do nothing */
-  type = toe->type;
-  if (type == FLEXTCP_PL_TOE_INVALID)
+  mtu = ETH_PAYLOAD_MAX;
+  for (i = 0; i < TX_BATCH_SIZE; i++)
   {
-    return EAGAIN;
+    addr = tasovs->tx_base + tasovs->tx_tail;
+    msg_len = sizeof(*toe);
+
+    ovs_assert(addr + msg_len >= addr && addr + msg_len <= dev->info->dma_mem_size);
+    toe = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + addr);
+
+    /* Kernel queue empty so do nothing */
+    type = toe->type;
+    if (type == FLEXTCP_PL_TOE_INVALID)
+      break;
+
+    /* Get packet from shm */
+    pkt_len = toe->msg.packet.len;
+    virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
+
+    /* Add packet to datapath batch */
+    pkt = dp_packet_new_with_headroom(pkt_len + mtu, DP_NETDEV_HEADROOM);
+    memcpy(dp_packet_data(pkt), virtuoso_buf, pkt_len);
+    dp_packet_set_size(pkt, pkt_len);
+
+    pkt->md.flow_group = toe->msg.packet.flow_group;
+    pkt->md.fn_core = toe->msg.packet.fn_core;
+    pkt->md.vmid = toe->msg.packet.vmid;
+    pkt->md.connaddr = toe->msg.packet.connaddr;
+    pkt->md.rxpkt = false;
+
+    tasovs->tx_tail += sizeof(*toe);
+    if (tasovs->tx_tail >= tasovs->tx_len)
+      tasovs->tx_tail -= tasovs->tx_len;
+
+    toe->type = 0;
+    
+    dp_packet_batch_add(batch, pkt);
   }
 
-  /* Get packet from shm */
-  pkt_len = toe->msg.packet.len;
-  virtuoso_buf = (void *) ((uint8_t *) dev->shms[SP_MEM_ID] + toe->addr);
+  if (i == 0)
+    return EAGAIN;
 
-  /* Add packet to datapath batch */
-  mtu = ETH_PAYLOAD_MAX;
-  pkt = dp_packet_new_with_headroom(pkt_len + mtu, DP_NETDEV_HEADROOM);
-  memcpy(dp_packet_data(pkt), virtuoso_buf, pkt_len);
-  dp_packet_set_size(pkt, pkt_len);
-
-  pkt->md.flow_group = toe->msg.packet.flow_group;
-  pkt->md.fn_core = toe->msg.packet.fn_core;
-  pkt->md.vmid = toe->msg.packet.vmid;
-  pkt->md.connaddr = toe->msg.packet.connaddr;
-  pkt->md.rxpkt = false;
-
-  tasovs->tx_tail += sizeof(*toe);
-  if (tasovs->tx_tail >= tasovs->tx_len)
-    tasovs->tx_tail -= tasovs->tx_len;
-
-  toe->type = 0;
-  
-  dp_packet_batch_add(batch, pkt);
   return 0;
 }
 
