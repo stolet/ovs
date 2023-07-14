@@ -23,7 +23,6 @@ struct netdev_virtuosotx {
   volatile struct flextcp_pl_mem *fp_state;
   struct eth_addr etheraddr;
   struct netdev_stats stats;
-  uint16_t vmid;
   ovs_be32 gre_key;
   struct in_addr out_remote_ip;
   struct in_addr out_local_ip;

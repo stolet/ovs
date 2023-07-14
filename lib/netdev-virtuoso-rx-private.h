@@ -17,6 +17,7 @@ struct netdev_virtuosorx {
   volatile void **shms;
   volatile struct flexnic_info *info;
   volatile struct flextcp_pl_mem *fp_state;
+  uint16_t vmid;
   struct eth_addr etheraddr;
   struct netdev_stats stats;
 };

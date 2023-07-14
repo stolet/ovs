@@ -40,6 +40,8 @@ netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev,
 static int
 netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
     struct dp_packet_batch *batch);
+static uint16_t
+parse_id(const struct smap *args, const char *name);
 
 bool 
 netdev_virtuosorx_is_virtuosorx_class(const struct netdev_class *class)
@@ -296,6 +298,41 @@ netdev_virtuosorx_update_flags(struct netdev *netdev OVS_UNUSED,
 }
 
 
+static int 
+netdev_virtuosorx_set_config(struct netdev *dev_, const struct smap *args, char **errp)
+{
+  struct netdev_virtuosorx *dev = netdev_virtuosorx_cast(dev_);
+  struct ds errors = DS_EMPTY_INITIALIZER;
+  int err = 0;
+
+  dev->vmid = parse_id(args, "vmid");
+
+  if (dev->vmid == 0)
+    goto out;
+
+  return 0;
+
+out:
+    if (errors.length) {
+        ds_chomp(&errors, '\n');
+        VLOG_WARN("%s", ds_cstr(&errors));
+        if (err) {
+            *errp = ds_steal_cstr(&errors);
+        }
+    }
+
+    ds_destroy(&errors);
+
+    return err;
+}
+
+static int
+netdev_virtuosorx_get_config(const struct netdev *dev_ OVS_UNUSED, 
+    struct smap *args OVS_UNUSED)
+{
+  return 0;
+}
+
 /* Performs periodic work needed by Virtuoso */
 static void
 netdev_virtuosorx_run(const struct netdev_class *netdev_class OVS_UNUSED)
@@ -382,7 +419,7 @@ netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev,
 
     /* Kernel queue empty so do nothing */
     type = toe->type;
-    if (type == FLEXTCP_PL_TOE_INVALID)
+    if (type != dev->vmid)
       break;
 
     /* Get packet from shm */
@@ -438,7 +475,7 @@ netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
 
     /* Kernel queue empty so do nothing */
     type = toe->type;
-    if (type == FLEXTCP_PL_TOE_INVALID)
+    if (type != dev->vmid)
       break;
 
     /* Get packet from shm */
@@ -483,6 +520,24 @@ netdev_virtuosorx_rxq_drain(struct netdev_rxq *rxq_ OVS_UNUSED)
   return 0;
 }
 
+
+static uint16_t
+parse_id(const struct smap *args, const char *name)
+{
+  const char *s;
+  s = smap_get(args, name);
+  if (!s)
+  {
+    s = smap_get(args, "id");
+    if (!s)
+    {
+      return 0;
+    }
+  }
+
+  return strtoul(s, NULL, 0);
+}
+
 #define NETDEV_VIRTUOSORX_COMMON_FUNCTIONS                   \
   .run = netdev_virtuosorx_run,                              \
   .wait = netdev_virtuosorx_wait,                            \
@@ -493,6 +548,8 @@ netdev_virtuosorx_rxq_drain(struct netdev_rxq *rxq_ OVS_UNUSED)
   .set_etheraddr = netdev_virtuosorx_set_etheraddr,          \
   .get_etheraddr = netdev_virtuosorx_get_etheraddr,          \
   .update_flags = netdev_virtuosorx_update_flags,            \
+  .set_config = netdev_virtuosorx_set_config,                \
+  .get_config = netdev_virtuosorx_get_config,                \
   .build_header = netdev_gre_build_header,                   \
   .pop_header = netdev_gre_pop_header,                       \
   .push_header = netdev_gre_push_header                     
