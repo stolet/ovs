@@ -528,7 +528,7 @@ parse_id(const struct smap *args, const char *name)
   s = smap_get(args, name);
   if (!s)
   {
-    s = smap_get(args, "id");
+    s = smap_get(args, "vmid");
     if (!s)
     {
       return 0;
