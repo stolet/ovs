@@ -419,7 +419,11 @@ netdev_virtuosorx_rxq_recvrx(struct netdev_virtuosorx *dev,
 
     /* Kernel queue empty so do nothing */
     type = toe->type;
-    if (type != dev->vmid)
+    if (type == FLEXTCP_PL_TOE_INVALID)
+      break;
+
+    /* Message not for this port so skip */
+    if (toe->msg.packet.vmid != dev->vmid)
       break;
 
     /* Get packet from shm */
@@ -475,7 +479,11 @@ netdev_virtuosorx_rxq_recvtx(struct netdev_virtuosorx *dev,
 
     /* Kernel queue empty so do nothing */
     type = toe->type;
-    if (type != dev->vmid)
+    if (type == FLEXTCP_PL_TOE_INVALID)
+      break;
+
+    /* Message not for this port so skip */
+    if (toe->msg.packet.vmid != dev->vmid)
       break;
 
     /* Get packet from shm */
