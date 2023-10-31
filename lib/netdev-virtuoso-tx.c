@@ -433,7 +433,7 @@ netdev_virtuosotx_send(struct netdev *netdev_, int qid OVS_UNUSED,
                        struct dp_packet_batch *batch OVS_UNUSED,
                        bool concurrent_txq OVS_UNUSED)
 {
-  int ret;
+  int ret = 0;
   int packet_drops = 0;
   struct netdev_virtuosotx *netdev = netdev_virtuosotx_cast(netdev_);
   struct dp_packet *pkt;
@@ -442,10 +442,10 @@ netdev_virtuosotx_send(struct netdev *netdev_, int qid OVS_UNUSED,
   ovs_mutex_lock(&netdev->tx_mutex);
   DP_PACKET_BATCH_FOR_EACH(i, pkt, batch)
   {
-    if (pkt->md.rxpkt)
+    if (pkt->md.rxpkt && pkt->md.in_port.ofp_port != 0)
     {
       ret = netdev_virtuosotx_sendrx(netdev, pkt);
-    } else 
+    } else if (pkt->md.in_port.ofp_port != 0)
     {
       ret = netdev_virtuosotx_sendtx(netdev, pkt);
     }
