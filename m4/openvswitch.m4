@@ -535,7 +535,7 @@ AC_DEFUN([OVS_CHECK_GROFF],
     [for groff],
     [ovs_cv_groff],
     [if (groff -v) >/dev/null 2>&1; then
-       ovs_cv_groff=yes
+       ovs_cv_groff=no
      else
        ovs_cv_groff=no
      fi])
