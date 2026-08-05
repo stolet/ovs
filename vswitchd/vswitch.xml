@@ -561,6 +561,31 @@
         </p>
       </column>
 
+      <column name="other_config" key="time-protection-refill-us"
+              type='{"type": "integer", "minInteger": 1}'>
+        <p>
+          Sets the refill period, in microseconds, for CPU-time protection of
+          DPDK vhost tenants.  The default is 1 microsecond.
+        </p>
+      </column>
+
+      <column name="other_config" key="time-protection-max-budget"
+              type='{"type": "integer", "minInteger": 1}'>
+        <p>
+          Sets the maximum core-local CPU-cycle budget that a DPDK vhost
+          tenant may accumulate.  The default is 15000 cycles.
+        </p>
+      </column>
+
+      <column name="other_config" key="time-protection-boost"
+              type='{"type": "real", "minReal": 0, "maxReal": 1}'>
+        <p>
+          Scales elapsed PMD cycles before equal-share budget distribution.
+          Values must be greater than zero and at most one.  The default is
+          0.85.
+        </p>
+      </column>
+
       <column name="other_config" key="smc-enable"
               type='{"type": "boolean"}'>
         <p>

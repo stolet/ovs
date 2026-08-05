@@ -20,6 +20,7 @@
 
 #include "dpif.h"
 #include "dpif-netdev-perf.h"
+#include "dpif-netdev-time-protection.h"
 #include "dpif-netdev-private-dfc.h"
 #include "dpif-netdev-private-dpif.h"
 
@@ -54,6 +55,17 @@ struct dp_netdev_pmd_thread_ctx {
     uint32_t emc_insert_min;
     /* Enable the SMC cache from ovsdb config. */
     bool smc_enable_db;
+    /* Time-protection accounting frame for nested recirculation. */
+    struct tp_account_frame *tp_frame;
+    /* A funded tenant has work in the current receive batch. */
+    bool tp_protected_work;
+    /* Source tenant when polling a vhost RX queue. */
+    struct dp_netdev_tp_tenant *tp_source_tenant;
+};
+
+struct dp_netdev_tp_tenant {
+    struct dp_netdev_port *port;
+    struct tp_budget budget;
 };
 
 /* PMD: Poll modes drivers.  PMD accesses devices via polling to eliminate
@@ -120,6 +132,14 @@ struct dp_netdev_pmd_thread {
 
     /* Current context of the PMD thread. */
     struct dp_netdev_pmd_thread_ctx ctx;
+
+    /* Core-local time-protection state, one entry per vhost port. */
+    struct dp_netdev_tp_tenant *tp_tenants;
+    size_t n_tp_tenants;
+    uint64_t tp_refill_cycles;
+    uint64_t tp_refill_quantum;
+    int64_t tp_max_budget;
+    size_t tp_slack_cursor;
 
     /* Function pointer to call for dp_netdev_input() functionality. */
     ATOMIC(dp_netdev_input_func) netdev_input_func;

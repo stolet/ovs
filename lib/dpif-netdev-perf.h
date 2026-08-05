@@ -241,6 +241,7 @@ cycles_counter_get(struct pmd_perf_stats *s)
 }
 
 void pmd_perf_estimate_tsc_frequency(void);
+uint64_t pmd_perf_tsc_frequency(void);
 
 /* A nestable timer for measuring execution time in TSC cycles.
  *

@@ -73,6 +73,40 @@ To clear previous stats::
 
     $ ovs-appctl dpif-netdev/pmd-stats-clear
 
+Time Protection
+---------------
+
+OvS applies CPU-time protection when a userspace datapath contains
+``dpdkvhost`` ports.  Each vhost port is an equal-weight tenant on every PMD
+core.  PMDs charge run-to-completion receive, action, recirculation, and
+transmit work in TSC cycles.  A tenant that exhausts its signed budget is
+skipped while funded tenants have work, but can use an otherwise idle PMD.
+
+The refill period, budget cap, and accounting boost are configured globally::
+
+    $ ovs-vsctl set Open_vSwitch . \
+        other_config:time-protection-refill-us=1 \
+        other_config:time-protection-max-budget=15000 \
+        other_config:time-protection-boost=0.85
+
+Current budgets and counters can be inspected or cleared with::
+
+    $ ovs-appctl dpif-netdev/time-protection-show
+    $ ovs-appctl dpif-netdev/time-protection-clear
+
+Time protection is intended for software-processed, unicast traffic between
+physical DPDK ports and vhost-user VMs.  Direct output and recirculation are
+attributed.  Flooding, clones, bonds, tunnels, multiple outputs, userspace
+upcalls, and hardware-offloaded traffic are not attributed.  Disable hardware
+offload for evaluated flows.  Use an unmodified OvS build for an accounting-
+free baseline.
+
+A typical evaluation pins one victim VM and one adversary VM to separate
+``dpdkvhostuserclient`` ports whose RX queues share a PMD core with the
+physical DPDK ingress port.  Use direct unicast flows (and an additional
+recirculating flow when measuring recirculation), fixed CPU affinity, and the
+same traffic and queue placement for the protected and unmodified builds.
+
 .. note::
 
     PMD stats are cumulative so they should be cleared in order to see how the

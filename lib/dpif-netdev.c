@@ -46,6 +46,7 @@
 #include "dpif.h"
 #include "dpif-netdev-lookup.h"
 #include "dpif-netdev-perf.h"
+#include "dpif-netdev-time-protection.h"
 #include "dpif-netdev-private-extract.h"
 #include "dpif-provider.h"
 #include "dummy.h"
@@ -280,6 +281,11 @@ struct dp_netdev {
     /* Enable the SMC cache from ovsdb config */
     atomic_bool smc_enable_db;
 
+    /* Time protection configuration. */
+    uint64_t tp_refill_us;
+    int64_t tp_max_budget;
+    double tp_boost;
+
     /* Protects access to ofproto-dpif-upcall interface during revalidator
      * thread synchronization. */
     struct fat_rwlock upcall_rwlock;
@@ -484,6 +490,7 @@ struct polled_queue {
     bool emc_enabled;
     bool rxq_enabled;
     uint64_t change_seq;
+    struct dp_netdev_tp_tenant *tp_tenant;
 };
 
 /* Contained by struct dp_netdev_pmd_thread's 'poll_list' member. */
@@ -503,6 +510,15 @@ struct tx_port {
     struct dp_packet_batch output_pkts;
     struct dp_packet_batch *txq_pkts; /* Only for hash mode. */
     struct dp_netdev_rxq *output_pkts_rxqs[NETDEV_MAX_BURST];
+    struct dp_netdev_tp_tenant *output_pkts_tp_tenants[NETDEV_MAX_BURST];
+    struct dp_netdev_tp_tenant *tp_tenant;
+};
+
+struct tp_account_frame {
+    struct tp_account_frame *parent;
+    struct dp_netdev_tp_tenant *tenant;
+    bool ambiguous;
+    bool slack;
 };
 
 /* Contained by struct tx_bond 'member_buckets'. */
@@ -600,6 +616,11 @@ static void dp_netdev_pmd_unref(struct dp_netdev_pmd_thread *pmd);
 static void dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd);
 static void pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
     OVS_REQUIRES(pmd->port_mutex);
+static struct dp_netdev_tp_tenant *
+tp_pmd_tenant_lookup(const struct dp_netdev_pmd_thread *,
+                     const struct dp_netdev_port *);
+static struct tx_port *pmd_send_port_cache_lookup(
+    const struct dp_netdev_pmd_thread *, odp_port_t);
 static inline void
 dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
                            struct polled_queue *poll_list, int poll_cnt);
@@ -1562,6 +1583,71 @@ dpif_netdev_bond_show(struct unixctl_conn *conn, int argc,
     ds_destroy(&reply);
 }
 
+static void
+dpif_netdev_time_protection(struct unixctl_conn *conn, int argc,
+                            const char *argv[], void *aux)
+{
+    bool clear = aux != NULL;
+    struct ds reply = DS_EMPTY_INITIALIZER;
+    struct dp_netdev *dp = NULL;
+    struct dp_netdev_pmd_thread *pmd;
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    if (argc == 2) {
+        dp = shash_find_data(&dp_netdevs, argv[1]);
+    } else if (shash_count(&dp_netdevs) == 1) {
+        dp = shash_first(&dp_netdevs)->data;
+    }
+    if (!dp) {
+        ovs_mutex_unlock(&dp_netdev_mutex);
+        unixctl_command_reply_error(conn,
+                                    "please specify an existing datapath");
+        return;
+    }
+
+    if (!clear) {
+        ds_put_format(&reply, "refill_us=%"PRIu64
+                      " max_budget=%"PRId64" boost=%.3f\n",
+                      dp->tp_refill_us, dp->tp_max_budget, dp->tp_boost);
+    }
+
+    CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+        ovs_mutex_lock(&pmd->port_mutex);
+        for (size_t i = 0; i < pmd->n_tp_tenants; i++) {
+            struct dp_netdev_tp_tenant *tenant = &pmd->tp_tenants[i];
+
+            if (clear) {
+                tp_budget_clear_stats(&tenant->budget);
+            } else {
+                unsigned long long rx, action, tx, funded, slack, drops;
+
+                atomic_read_relaxed(&tenant->budget.rx_cycles, &rx);
+                atomic_read_relaxed(&tenant->budget.action_cycles, &action);
+                atomic_read_relaxed(&tenant->budget.tx_cycles, &tx);
+                atomic_read_relaxed(&tenant->budget.funded_batches,
+                                    &funded);
+                atomic_read_relaxed(&tenant->budget.slack_batches, &slack);
+                atomic_read_relaxed(&tenant->budget.dropped_packets, &drops);
+                ds_put_format(&reply,
+                              "pmd=%u tenant=%s port=%"PRIu32
+                              " budget=%"PRId64" rx=%llu action=%llu"
+                              " tx=%llu funded=%llu slack=%llu drops=%llu\n",
+                              pmd->core_id,
+                              netdev_get_name(tenant->port->netdev),
+                              odp_to_u32(tenant->port->port_no),
+                              tp_budget_get(&tenant->budget), rx, action, tx,
+                              funded, slack, drops);
+            }
+        }
+        ovs_mutex_unlock(&pmd->port_mutex);
+    }
+    ovs_mutex_unlock(&dp_netdev_mutex);
+
+    unixctl_command_reply(conn, clear ? "time protection statistics cleared"
+                                      : ds_cstr(&reply));
+    ds_destroy(&reply);
+}
+
 
 static int
 dpif_netdev_init(void)
@@ -1596,6 +1682,11 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/bond-show", "[dp]",
                              0, 1, dpif_netdev_bond_show,
                              NULL);
+    unixctl_command_register("dpif-netdev/time-protection-show", "[dp]",
+                             0, 1, dpif_netdev_time_protection, NULL);
+    unixctl_command_register("dpif-netdev/time-protection-clear", "[dp]",
+                             0, 1, dpif_netdev_time_protection,
+                             (void *) true);
     unixctl_command_register("dpif-netdev/subtable-lookup-prio-set",
                              "[lookup_func] [prio]",
                              2, 2, dpif_netdev_subtable_lookup_set,
@@ -1826,6 +1917,9 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
 
     atomic_init(&dp->emc_insert_min, DEFAULT_EM_FLOW_INSERT_MIN);
     atomic_init(&dp->tx_flush_interval, DEFAULT_TX_FLUSH_INTERVAL);
+    dp->tp_refill_us = TP_DEFAULT_REFILL_US;
+    dp->tp_max_budget = TP_DEFAULT_MAX_BUDGET;
+    dp->tp_boost = TP_DEFAULT_BOOST;
 
     cmap_init(&dp->poll_threads);
     dp->pmd_rxq_assign_type = SCHED_CYCLES;
@@ -4793,6 +4887,13 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
     uint32_t rebalance_load, rebalance_improve;
     bool log_autolb = false;
     enum sched_assignment_type pmd_rxq_assign_type;
+    const char *tp_value;
+    unsigned long long tp_ull;
+    uint64_t tp_refill_us = TP_DEFAULT_REFILL_US;
+    int64_t tp_max_budget = TP_DEFAULT_MAX_BUDGET;
+    double tp_boost = TP_DEFAULT_BOOST;
+    bool tp_changed = false;
+    struct dp_netdev_pmd_thread *pmd;
 
     tx_flush_interval = smap_get_int(other_config, "tx-flush-interval",
                                      DEFAULT_TX_FLUSH_INTERVAL);
@@ -4801,6 +4902,57 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
         atomic_store_relaxed(&dp->tx_flush_interval, tx_flush_interval);
         VLOG_INFO("Flushing interval for tx queues set to %"PRIu32" us",
                   tx_flush_interval);
+    }
+
+    tp_value = smap_get(other_config, "time-protection-refill-us");
+    if (tp_value) {
+        if (str_to_ullong(tp_value, 10, &tp_ull) && tp_ull > 0
+            && tp_ull <= 1000000) {
+            tp_refill_us = tp_ull;
+        } else {
+            VLOG_WARN("Invalid time-protection-refill-us '%s'; using %d",
+                      tp_value, TP_DEFAULT_REFILL_US);
+        }
+    }
+    tp_value = smap_get(other_config, "time-protection-max-budget");
+    if (tp_value) {
+        if (str_to_ullong(tp_value, 10, &tp_ull) && tp_ull > 0
+            && tp_ull <= INT64_MAX) {
+            tp_max_budget = tp_ull;
+        } else {
+            VLOG_WARN("Invalid time-protection-max-budget '%s'; using %d",
+                      tp_value, TP_DEFAULT_MAX_BUDGET);
+        }
+    }
+    tp_value = smap_get(other_config, "time-protection-boost");
+    if (tp_value) {
+        if (!str_to_double(tp_value, &tp_boost)
+            || !(tp_boost > 0.0 && tp_boost <= 1.0)) {
+            VLOG_WARN("Invalid time-protection-boost '%s'; using %.2f",
+                      tp_value, TP_DEFAULT_BOOST);
+            tp_boost = TP_DEFAULT_BOOST;
+        }
+    }
+    if (dp->tp_refill_us != tp_refill_us) {
+        dp->tp_refill_us = tp_refill_us;
+        tp_changed = true;
+    }
+    if (dp->tp_max_budget != tp_max_budget) {
+        dp->tp_max_budget = tp_max_budget;
+        tp_changed = true;
+    }
+    if (dp->tp_boost != tp_boost) {
+        dp->tp_boost = tp_boost;
+        tp_changed = true;
+    }
+    if (tp_changed) {
+        VLOG_INFO("Time protection configured: refill=%"PRIu64
+                  " us, max budget=%"PRId64" cycles, boost=%.3f",
+                  dp->tp_refill_us, dp->tp_max_budget, dp->tp_boost);
+        dp_netdev_request_reconfigure(dp);
+        CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+            pmd->need_reload = true;
+        }
     }
 
     if (!nullable_string_is_equal(dp->pmd_cmask, cmask)) {
@@ -5275,9 +5427,20 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
      * their respective rx queues. */
     cycles = cycle_timer_stop(&pmd->perf_stats, &timer) / output_cnt;
     for (i = 0; i < output_cnt; i++) {
+        struct dp_netdev_tp_tenant *tenant =
+            p->output_pkts_tp_tenants[i];
+
         if (p->output_pkts_rxqs[i]) {
             dp_netdev_rxq_add_cycles(p->output_pkts_rxqs[i],
                                      RXQ_CYCLES_PROC_CURR, cycles);
+        }
+        if (tenant) {
+            tp_budget_refill(&tenant->budget,
+                             cycles_counter_get(&pmd->perf_stats),
+                             pmd->tp_refill_cycles,
+                             pmd->tp_refill_quantum,
+                             pmd->tp_max_budget);
+            tp_budget_charge(&tenant->budget, cycles, TP_CHARGE_TX);
         }
     }
 
@@ -6790,6 +6953,68 @@ pmd_free_cached_ports(struct dp_netdev_pmd_thread *pmd)
     }
 }
 
+static bool
+tp_port_is_tenant(const struct dp_netdev_port *port)
+{
+    return !strncmp(port->type, "dpdkvhost", 9);
+}
+
+static struct dp_netdev_tp_tenant *
+tp_pmd_tenant_lookup(const struct dp_netdev_pmd_thread *pmd,
+                     const struct dp_netdev_port *port)
+{
+    for (size_t i = 0; i < pmd->n_tp_tenants; i++) {
+        if (pmd->tp_tenants[i].port == port) {
+            return &pmd->tp_tenants[i];
+        }
+    }
+    return NULL;
+}
+
+static void
+tp_pmd_rebuild(struct dp_netdev_pmd_thread *pmd)
+{
+    struct tx_port *tx;
+    uint64_t hz = pmd_perf_tsc_frequency();
+    uint64_t period;
+    size_t n = 0;
+
+    HMAP_FOR_EACH (tx, node, &pmd->tx_ports) {
+        if (tp_port_is_tenant(tx->port)) {
+            n++;
+        }
+    }
+    if (pmd->core_id == NON_PMD_CORE_ID) {
+        n = 0;
+    }
+
+    free(pmd->tp_tenants);
+    pmd->tp_tenants = n ? xcalloc(n, sizeof *pmd->tp_tenants) : NULL;
+    pmd->n_tp_tenants = n;
+    pmd->tp_slack_cursor = 0;
+    pmd->tp_max_budget = pmd->dp->tp_max_budget;
+    period = hz / 1000000 * pmd->dp->tp_refill_us;
+    pmd->tp_refill_cycles = MAX(period, 1);
+    pmd->tp_refill_quantum = n
+        ? MAX((uint64_t) (pmd->tp_refill_cycles * pmd->dp->tp_boost / n), 1)
+        : 0;
+
+    if (!pmd->n_tp_tenants) {
+        return;
+    }
+
+    n = 0;
+    HMAP_FOR_EACH (tx, node, &pmd->tx_ports) {
+        if (tp_port_is_tenant(tx->port)) {
+            struct dp_netdev_tp_tenant *tenant = &pmd->tp_tenants[n++];
+
+            tenant->port = tx->port;
+            tp_budget_init(&tenant->budget, pmd->tp_max_budget,
+                           cycles_counter_update(&pmd->perf_stats));
+        }
+    }
+}
+
 /* Copies ports from 'pmd->tx_ports' (shared with the main thread) to
  * thread-local copies. Copy to 'pmd->tnl_port_cache' if it is a tunnel
  * device, otherwise to 'pmd->send_port_cache' if the port has at least
@@ -6801,6 +7026,7 @@ pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
     struct tx_port *tx_port, *tx_port_cached;
 
     pmd_free_cached_ports(pmd);
+    tp_pmd_rebuild(pmd);
     hmap_shrink(&pmd->send_port_cache);
     hmap_shrink(&pmd->tnl_port_cache);
 
@@ -6810,6 +7036,8 @@ pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
 
         if (netdev_has_tunnel_push_pop(tx_port->port->netdev)) {
             tx_port_cached = xmemdup(tx_port, sizeof *tx_port_cached);
+            tx_port_cached->tp_tenant =
+                tp_pmd_tenant_lookup(pmd, tx_port->port);
             if (tx_port->txq_pkts) {
                 txq_pkts_cached = xmemdup(tx_port->txq_pkts,
                                           n_txq * sizeof *tx_port->txq_pkts);
@@ -6821,6 +7049,8 @@ pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
 
         if (n_txq) {
             tx_port_cached = xmemdup(tx_port, sizeof *tx_port_cached);
+            tx_port_cached->tp_tenant =
+                tp_pmd_tenant_lookup(pmd, tx_port->port);
             if (tx_port->txq_pkts) {
                 txq_pkts_cached = xmemdup(tx_port->txq_pkts,
                                           n_txq * sizeof *tx_port->txq_pkts);
@@ -6863,6 +7093,7 @@ pmd_load_queues_and_ports(struct dp_netdev_pmd_thread *pmd,
     int i;
 
     ovs_mutex_lock(&pmd->port_mutex);
+    pmd_load_cached_ports(pmd);
     poll_list = xrealloc(poll_list, hmap_count(&pmd->poll_list)
                                     * sizeof *poll_list);
 
@@ -6874,10 +7105,10 @@ pmd_load_queues_and_ports(struct dp_netdev_pmd_thread *pmd,
         poll_list[i].rxq_enabled = netdev_rxq_enabled(poll->rxq->rx);
         poll_list[i].change_seq =
                      netdev_get_change_seq(poll->rxq->port->netdev);
+        poll_list[i].tp_tenant =
+            tp_pmd_tenant_lookup(pmd, poll->rxq->port);
         i++;
     }
-
-    pmd_load_cached_ports(pmd);
 
     ovs_mutex_unlock(&pmd->port_mutex);
 
@@ -6959,14 +7190,26 @@ reload:
     ovs_mutex_lock(&pmd->perf_stats.stats_mutex);
     for (;;) {
         uint64_t rx_packets = 0, tx_packets = 0;
+        uint64_t now_tsc;
 
         pmd_perf_start_iteration(s);
 
         atomic_read_relaxed(&pmd->dp->smc_enable_db, &pmd->ctx.smc_enable_db);
 
+        now_tsc = cycles_counter_update(s);
         for (i = 0; i < poll_cnt; i++) {
+            struct dp_netdev_tp_tenant *tenant = poll_list[i].tp_tenant;
+            uint64_t start_tsc;
 
             if (!poll_list[i].rxq_enabled) {
+                continue;
+            }
+
+            if (tenant
+                && !tp_budget_is_funded(&tenant->budget, now_tsc,
+                                         pmd->tp_refill_cycles,
+                                         pmd->tp_refill_quantum,
+                                         pmd->tp_max_budget)) {
                 continue;
             }
 
@@ -6977,10 +7220,53 @@ reload:
                 pmd->ctx.emc_insert_min = 0;
             }
 
-            process_packets =
-                dp_netdev_process_rxq_port(pmd, poll_list[i].rxq,
-                                           poll_list[i].port_no);
+            pmd->ctx.tp_protected_work = tenant != NULL;
+            pmd->ctx.tp_source_tenant = tenant;
+            start_tsc = tenant ? cycles_counter_update(s) : 0;
+            process_packets = dp_netdev_process_rxq_port(
+                pmd, poll_list[i].rxq, poll_list[i].port_no);
+            if (tenant && process_packets) {
+                uint64_t elapsed = cycles_counter_update(s) - start_tsc;
+
+                tp_budget_charge(&tenant->budget, elapsed, TP_CHARGE_RX);
+                tp_budget_record_batch(&tenant->budget, false);
+            }
+            pmd->ctx.tp_source_tenant = NULL;
+            pmd->ctx.tp_protected_work = false;
             rx_packets += process_packets;
+        }
+
+        /* Work conservation: if funded queues had no work, allow one
+         * out-of-budget vhost queue to run to completion. */
+        if (!rx_packets && poll_cnt && pmd->n_tp_tenants) {
+            for (int offset = 0; offset < poll_cnt; offset++) {
+                int idx = (pmd->tp_slack_cursor + offset) % poll_cnt;
+                struct dp_netdev_tp_tenant *tenant =
+                    poll_list[idx].tp_tenant;
+                uint64_t start_tsc;
+
+                if (!tenant || !poll_list[idx].rxq_enabled
+                    || tp_budget_is_funded(&tenant->budget, now_tsc,
+                                            pmd->tp_refill_cycles,
+                                            pmd->tp_refill_quantum,
+                                            pmd->tp_max_budget)) {
+                    continue;
+                }
+                pmd->tp_slack_cursor = (idx + 1) % poll_cnt;
+                pmd->ctx.tp_source_tenant = tenant;
+                start_tsc = cycles_counter_update(s);
+                process_packets = dp_netdev_process_rxq_port(
+                    pmd, poll_list[idx].rxq, poll_list[idx].port_no);
+                if (process_packets) {
+                    tp_budget_charge(&tenant->budget,
+                                     cycles_counter_update(s) - start_tsc,
+                                     TP_CHARGE_RX);
+                    tp_budget_record_batch(&tenant->budget, true);
+                    rx_packets += process_packets;
+                }
+                pmd->ctx.tp_source_tenant = NULL;
+                break;
+            }
         }
 
         if (!rx_packets) {
@@ -7486,6 +7772,11 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
     ccmap_init(&pmd->n_flows);
     ccmap_init(&pmd->n_simple_flows);
     pmd->ctx.last_rxq = NULL;
+    pmd->ctx.tp_frame = NULL;
+    pmd->ctx.tp_protected_work = false;
+    pmd->ctx.tp_source_tenant = NULL;
+    pmd->tp_tenants = NULL;
+    pmd->n_tp_tenants = 0;
     pmd_thread_ctx_time_update(pmd);
     pmd->next_optimization = pmd->ctx.now + DPCLS_OPTIMIZATION_INTERVAL;
     pmd->next_rcu_quiesce = pmd->ctx.now + PMD_RCU_QUIESCE_INTERVAL;
@@ -7527,6 +7818,7 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
     cmap_destroy(&pmd->tx_bonds);
     hmap_destroy(&pmd->poll_list);
     free(pmd->busy_cycles_intrvl);
+    free(pmd->tp_tenants);
     /* All flows (including their dpcls_rules) have been deleted already */
     CMAP_FOR_EACH (cls, node, &pmd->classifiers) {
         dpcls_destroy(cls);
@@ -7856,8 +8148,11 @@ dpif_netdev_packet_get_rss_hash(struct dp_packet *packet,
 
 struct packet_batch_per_flow {
     unsigned int byte_count;
+    unsigned int packet_count;
     uint16_t tcp_flags;
     struct dp_netdev_flow *flow;
+    struct dp_netdev_tp_tenant *tp_tenant;
+    bool tp_ambiguous;
 
     struct dp_packet_batch array;
 };
@@ -7868,6 +8163,7 @@ packet_batch_per_flow_update(struct packet_batch_per_flow *batch,
                              uint16_t tcp_flags)
 {
     batch->byte_count += dp_packet_size(packet);
+    batch->packet_count++;
     batch->tcp_flags |= tcp_flags;
     dp_packet_batch_add(&batch->array, packet);
 }
@@ -7879,17 +8175,65 @@ packet_batch_per_flow_init(struct packet_batch_per_flow *batch,
     flow->batch = batch;
 
     batch->flow = flow;
+    batch->tp_tenant = NULL;
+    batch->tp_ambiguous = false;
     dp_packet_batch_init(&batch->array);
     batch->byte_count = 0;
+    batch->packet_count = 0;
     batch->tcp_flags = 0;
 }
 
-static inline void
+static struct dp_netdev_tp_tenant *
+tp_actions_tenant(struct dp_netdev_pmd_thread *pmd,
+                  const struct nlattr *actions, size_t actions_len,
+                  bool *ambiguous)
+{
+    const struct nlattr *action;
+    struct dp_netdev_tp_tenant *tenant = NULL;
+    bool recirculates = false;
+    size_t outputs = 0;
+    size_t left;
+
+    NL_ATTR_FOR_EACH_UNSAFE (action, left, actions, actions_len) {
+        if (nl_attr_type(action) == OVS_ACTION_ATTR_RECIRC) {
+            recirculates = true;
+        } else if (nl_attr_type(action) == OVS_ACTION_ATTR_CLONE
+            || nl_attr_type(action) == OVS_ACTION_ATTR_LB_OUTPUT
+            || nl_attr_type(action) == OVS_ACTION_ATTR_TUNNEL_PUSH
+            || nl_attr_type(action) == OVS_ACTION_ATTR_TUNNEL_POP
+            || nl_attr_type(action) == OVS_ACTION_ATTR_USERSPACE) {
+            *ambiguous = true;
+            return NULL;
+        } else if (nl_attr_type(action) == OVS_ACTION_ATTR_OUTPUT) {
+            struct tx_port *port = pmd_send_port_cache_lookup(
+                pmd, nl_attr_get_odp_port(action));
+
+            outputs++;
+            if (port && port->tp_tenant) {
+                tenant = port->tp_tenant;
+            }
+        }
+    }
+    if (outputs == 1 && tenant && !recirculates) {
+        return tenant;
+    }
+    *ambiguous = outputs > 0;
+    return NULL;
+}
+
+static void
 packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
                               struct dp_netdev_pmd_thread *pmd)
 {
     struct dp_netdev_actions *actions;
     struct dp_netdev_flow *flow = batch->flow;
+    struct tp_account_frame frame = {
+        .parent = pmd->ctx.tp_frame,
+        .tenant = batch->tp_tenant,
+        .ambiguous = batch->tp_ambiguous,
+    };
+    uint64_t start_tsc = 0;
+    bool funded = true;
 
     dp_netdev_flow_used(flow, dp_packet_batch_size(&batch->array),
                         batch->byte_count,
@@ -7897,8 +8241,49 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
 
     actions = dp_netdev_flow_get_actions(flow);
 
+    if (batch->tp_tenant && !pmd->ctx.tp_source_tenant) {
+        funded = tp_budget_is_funded(&batch->tp_tenant->budget,
+                                     cycles_counter_update(&pmd->perf_stats),
+                                     pmd->tp_refill_cycles,
+                                     pmd->tp_refill_quantum,
+                                     pmd->tp_max_budget);
+        if (!funded && pmd->ctx.tp_protected_work) {
+            size_t count = dp_packet_batch_size(&batch->array);
+
+            tp_budget_record_drop(&batch->tp_tenant->budget, count);
+            dp_packet_delete_batch(&batch->array, true);
+            return;
+        }
+    }
+
+    if (!pmd->ctx.tp_source_tenant) {
+        start_tsc = cycles_counter_update(&pmd->perf_stats);
+        pmd->ctx.tp_frame = &frame;
+    }
+
     dp_netdev_execute_actions(pmd, &batch->array, true, &flow->flow,
                               actions->actions, actions->size);
+
+    if (!pmd->ctx.tp_source_tenant) {
+        uint64_t elapsed = cycles_counter_update(&pmd->perf_stats) - start_tsc;
+
+        pmd->ctx.tp_frame = frame.parent;
+        if (frame.parent) {
+            if (frame.ambiguous || (frame.parent->tenant
+                                    && frame.parent->tenant != frame.tenant)) {
+                frame.parent->ambiguous = true;
+            } else if (frame.tenant) {
+                frame.parent->tenant = frame.tenant;
+            }
+            frame.parent->slack |= frame.slack;
+        } else if (frame.tenant && !frame.ambiguous) {
+            batch->tp_tenant = frame.tenant;
+            tp_budget_charge(&frame.tenant->budget, elapsed,
+                             TP_CHARGE_ACTION);
+            tp_budget_record_batch(&frame.tenant->budget,
+                                   !funded || frame.slack);
+        }
+    }
 }
 
 void
@@ -8472,6 +8857,13 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
                   struct dp_packet_batch *packets,
                   bool md_is_valid, odp_port_t port_no)
 {
+    bool tp_protected_work_saved = pmd->ctx.tp_protected_work;
+    bool tp_account_prelim = !pmd->ctx.tp_source_tenant
+                             && !pmd->ctx.tp_frame;
+    uint64_t tp_prelim_start = tp_account_prelim
+        ? cycles_counter_update(&pmd->perf_stats) : 0;
+    uint64_t tp_prelim_cycles = 0;
+    size_t tp_input_count = dp_packet_batch_size(packets);
 #if !defined(__CHECKER__) && !defined(_WIN32)
     const size_t PKT_ARRAY_SIZE = dp_packet_batch_size(packets);
 #else
@@ -8524,8 +8916,55 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
         batches[i].flow->batch = NULL;
     }
 
+    /* Direct single-vhost outputs are attributable before action execution.
+     * Discover them in one pass so funded work protects against an
+     * out-of-budget batch regardless of its position in this RX burst. */
+    if (!pmd->ctx.tp_source_tenant) {
+        if (!pmd->ctx.tp_frame) {
+            pmd->ctx.tp_protected_work = false;
+        }
+        for (i = 0; i < n_batches; i++) {
+            struct dp_netdev_actions *actions =
+                dp_netdev_flow_get_actions(batches[i].flow);
+
+            batches[i].tp_tenant = tp_actions_tenant(
+                pmd, actions->actions, actions->size,
+                &batches[i].tp_ambiguous);
+            if (batches[i].tp_tenant
+                && tp_budget_is_funded(&batches[i].tp_tenant->budget,
+                                        cycles_counter_update(
+                                            &pmd->perf_stats),
+                                        pmd->tp_refill_cycles,
+                                        pmd->tp_refill_quantum,
+                                        pmd->tp_max_budget)) {
+                pmd->ctx.tp_protected_work = true;
+            }
+        }
+    }
+
+    if (tp_account_prelim) {
+        tp_prelim_cycles = cycles_counter_update(&pmd->perf_stats)
+                           - tp_prelim_start;
+    }
+
     for (i = 0; i < n_batches; i++) {
         packet_batch_per_flow_execute(&batches[i], pmd);
+    }
+    if (tp_account_prelim && tp_input_count) {
+        for (i = 0; i < n_batches; i++) {
+            struct dp_netdev_tp_tenant *tenant = batches[i].tp_tenant;
+
+            if (tenant) {
+                uint64_t cycles = (tp_prelim_cycles / tp_input_count)
+                                  * batches[i].packet_count;
+                cycles += (tp_prelim_cycles % tp_input_count)
+                          * batches[i].packet_count / tp_input_count;
+                tp_budget_charge(&tenant->budget, cycles, TP_CHARGE_RX);
+            }
+        }
+    }
+    if (pmd->ctx.tp_frame) {
+        pmd->ctx.tp_protected_work = tp_protected_work_saved;
     }
 }
 
@@ -8706,10 +9145,41 @@ dp_execute_output_action(struct dp_netdev_pmd_thread *pmd,
 {
     struct tx_port *p = pmd_send_port_cache_lookup(pmd, port_no);
     struct dp_packet_batch out;
+    struct dp_netdev_tp_tenant *tp_tx_tenant = pmd->ctx.tp_source_tenant;
+    bool tp_funded = true;
 
     if (!OVS_LIKELY(p)) {
         COVERAGE_ADD(datapath_drop_invalid_port,
                      dp_packet_batch_size(packets_));
+        dp_packet_delete_batch(packets_, should_steal);
+        return false;
+    }
+    if (p->tp_tenant && pmd->ctx.tp_frame
+        && !pmd->ctx.tp_frame->ambiguous) {
+        struct tp_account_frame *frame = pmd->ctx.tp_frame;
+
+        if (frame->tenant && frame->tenant != p->tp_tenant) {
+            frame->ambiguous = true;
+        } else {
+            frame->tenant = p->tp_tenant;
+        }
+    }
+    if (p->tp_tenant && !pmd->ctx.tp_source_tenant
+        && pmd->ctx.tp_frame && !pmd->ctx.tp_frame->ambiguous) {
+        tp_funded = tp_budget_is_funded(
+            &p->tp_tenant->budget,
+            cycles_counter_update(&pmd->perf_stats),
+            pmd->tp_refill_cycles, pmd->tp_refill_quantum,
+            pmd->tp_max_budget);
+        if (!tp_funded && pmd->ctx.tp_frame) {
+            pmd->ctx.tp_frame->slack = true;
+        }
+        tp_tx_tenant = p->tp_tenant;
+    }
+    if (p->tp_tenant && !tp_funded && pmd->ctx.tp_protected_work) {
+        size_t count = dp_packet_batch_size(packets_);
+
+        tp_budget_record_drop(&p->tp_tenant->budget, count);
         dp_packet_delete_batch(packets_, should_steal);
         return false;
     }
@@ -8740,8 +9210,10 @@ dp_execute_output_action(struct dp_netdev_pmd_thread *pmd,
 
     struct dp_packet *packet;
     DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
-        p->output_pkts_rxqs[dp_packet_batch_size(&p->output_pkts)] =
-            pmd->ctx.last_rxq;
+        size_t output_idx = dp_packet_batch_size(&p->output_pkts);
+
+        p->output_pkts_rxqs[output_idx] = pmd->ctx.last_rxq;
+        p->output_pkts_tp_tenants[output_idx] = tp_tx_tenant;
         dp_packet_batch_add(&p->output_pkts, packet);
     }
     return true;

@@ -83,6 +83,22 @@ skb_priority(0),skb_mark(0),ct_state(0),ct_zone(0),ct_mark(0),ct_label(0),recirc
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 
+AT_SETUP([dpif-netdev - time protection configuration and statistics])
+OVS_VSWITCHD_START
+
+AT_CHECK([ovs-vsctl set Open_vSwitch . \
+          other_config:time-protection-refill-us=7 \
+          other_config:time-protection-max-budget=42000 \
+          other_config:time-protection-boost=0.75])
+OVS_WAIT_UNTIL([ovs-appctl dpif-netdev/time-protection-show | \
+                grep 'refill_us=7 max_budget=42000 boost=0.750'])
+AT_CHECK([ovs-appctl dpif-netdev/time-protection-clear], [0],
+         [time protection statistics cleared
+])
+
+OVS_VSWITCHD_STOP
+AT_CLEANUP
+
 
 m4_define([DPIF_NETDEV_DUMMY_IFACE],
   [AT_SETUP([dpif-netdev - $1 interface])
