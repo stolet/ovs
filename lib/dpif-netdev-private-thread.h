@@ -139,7 +139,6 @@ struct dp_netdev_pmd_thread {
     uint64_t tp_refill_cycles;
     uint64_t tp_refill_quantum;
     int64_t tp_max_budget;
-    size_t tp_slack_cursor;
 
     /* Function pointer to call for dp_netdev_input() functionality. */
     ATOMIC(dp_netdev_input_func) netdev_input_func;

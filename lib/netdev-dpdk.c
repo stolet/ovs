@@ -130,6 +130,9 @@ BUILD_ASSERT_DECL((MAX_NB_MBUF / ROUND_DOWN_POW2(MAX_NB_MBUF / MIN_NB_MBUF))
 #define OVS_VHOST_QUEUE_MAP_UNKNOWN (-1) /* Mapping not initialized. */
 #define OVS_VHOST_QUEUE_DISABLED    (-2) /* Queue was disabled by guest and not
                                           * yet mapped to another queue. */
+/* Bound the non-preemptible work between time-protection interventions. */
+#define OVS_TP_NIC_HW_RX_BURST 4
+#define OVS_TP_MAX_VHOST_RX_BURST 4
 
 #define DPDK_ETH_PORT_ID_INVALID    RTE_MAX_ETHPORTS
 
@@ -2444,13 +2447,13 @@ netdev_dpdk_vhost_rxq_recv(struct netdev_rxq *rxq,
 
     nb_rx = rte_vhost_dequeue_burst(vid, qid, dev->dpdk_mp->mp,
                                     (struct rte_mbuf **) batch->packets,
-                                    NETDEV_MAX_BURST);
+                                    OVS_TP_MAX_VHOST_RX_BURST);
     if (!nb_rx) {
         return EAGAIN;
     }
 
     if (qfill) {
-        if (nb_rx == NETDEV_MAX_BURST) {
+        if (nb_rx == OVS_TP_MAX_VHOST_RX_BURST) {
             /* The DPDK API returns a uint32_t which often has invalid bits in
              * the upper 16-bits. Need to restrict the value to uint16_t. */
             *qfill = rte_vhost_rx_queue_count(vid, qid) & UINT16_MAX;
@@ -2502,7 +2505,7 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
 
     nb_rx = rte_eth_rx_burst(rx->port_id, rxq->queue_id,
                              (struct rte_mbuf **) batch->packets,
-                             NETDEV_MAX_BURST);
+                             OVS_TP_NIC_HW_RX_BURST);
     if (!nb_rx) {
         return EAGAIN;
     }
@@ -2527,7 +2530,7 @@ netdev_dpdk_rxq_recv(struct netdev_rxq *rxq, struct dp_packet_batch *batch,
     dp_packet_batch_init_packet_fields(batch);
 
     if (qfill) {
-        if (nb_rx == NETDEV_MAX_BURST) {
+        if (nb_rx == OVS_TP_NIC_HW_RX_BURST) {
             *qfill = rte_eth_rx_queue_count(rx->port_id, rxq->queue_id);
         } else {
             *qfill = 0;

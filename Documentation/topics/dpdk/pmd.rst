@@ -80,7 +80,11 @@ OvS applies CPU-time protection when a userspace datapath contains
 ``dpdkvhost`` ports.  Each vhost port is an equal-weight tenant on every PMD
 core.  PMDs charge run-to-completion receive, action, recirculation, and
 transmit work in TSC cycles.  A tenant that exhausts its signed budget is
-skipped while funded tenants have work, but can use an otherwise idle PMD.
+skipped until its budget is refilled.  DPDK physical and vhost receive bursts
+are limited to four packets to bound the non-preemptible work between budget
+checks.  When recirculation first discovers a single vhost destination, OvS
+caches that attribution on the datapath flow so later batches can be checked
+and rejected when out of budget before repeating the recirculation work.
 
 The refill period, budget cap, and accounting boost are configured globally::
 

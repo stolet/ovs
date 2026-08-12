@@ -116,6 +116,8 @@ struct dp_netdev_flow {
 
     /* Actions. */
     OVSRCU_TYPE(struct dp_netdev_actions *) actions;
+    /* Single vhost output learned from synchronous recirculation. */
+    atomic_uint32_t tp_output_port;
 
     /* While processing a group of input packets, the datapath uses the next
      * member to store a pointer to the output batch for the flow.  It is

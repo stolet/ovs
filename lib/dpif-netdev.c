@@ -4197,6 +4197,7 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     flow->batch = NULL;
     flow->mark = INVALID_FLOW_MARK;
     flow->orig_in_port = orig_in_port;
+    atomic_init(&flow->tp_output_port, odp_to_u32(ODPP_NONE));
     *CONST_CAST(unsigned *, &flow->pmd_id) = pmd->core_id;
     *CONST_CAST(struct flow *, &flow->flow) = match->flow;
     *CONST_CAST(ovs_u128 *, &flow->ufid) = *ufid;
@@ -4271,6 +4272,8 @@ flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
 
             old_actions = dp_netdev_flow_get_actions(netdev_flow);
             ovsrcu_set(&netdev_flow->actions, new_actions);
+            atomic_store_relaxed(&netdev_flow->tp_output_port,
+                                 odp_to_u32(ODPP_NONE));
 
             queue_netdev_flow_put(pmd, netdev_flow, match,
                                   put->actions, put->actions_len,
@@ -6991,7 +6994,6 @@ tp_pmd_rebuild(struct dp_netdev_pmd_thread *pmd)
     free(pmd->tp_tenants);
     pmd->tp_tenants = n ? xcalloc(n, sizeof *pmd->tp_tenants) : NULL;
     pmd->n_tp_tenants = n;
-    pmd->tp_slack_cursor = 0;
     pmd->tp_max_budget = pmd->dp->tp_max_budget;
     period = hz / 1000000 * pmd->dp->tp_refill_us;
     pmd->tp_refill_cycles = MAX(period, 1);
@@ -7234,39 +7236,6 @@ reload:
             pmd->ctx.tp_source_tenant = NULL;
             pmd->ctx.tp_protected_work = false;
             rx_packets += process_packets;
-        }
-
-        /* Work conservation: if funded queues had no work, allow one
-         * out-of-budget vhost queue to run to completion. */
-        if (!rx_packets && poll_cnt && pmd->n_tp_tenants) {
-            for (int offset = 0; offset < poll_cnt; offset++) {
-                int idx = (pmd->tp_slack_cursor + offset) % poll_cnt;
-                struct dp_netdev_tp_tenant *tenant =
-                    poll_list[idx].tp_tenant;
-                uint64_t start_tsc;
-
-                if (!tenant || !poll_list[idx].rxq_enabled
-                    || tp_budget_is_funded(&tenant->budget, now_tsc,
-                                            pmd->tp_refill_cycles,
-                                            pmd->tp_refill_quantum,
-                                            pmd->tp_max_budget)) {
-                    continue;
-                }
-                pmd->tp_slack_cursor = (idx + 1) % poll_cnt;
-                pmd->ctx.tp_source_tenant = tenant;
-                start_tsc = cycles_counter_update(s);
-                process_packets = dp_netdev_process_rxq_port(
-                    pmd, poll_list[idx].rxq, poll_list[idx].port_no);
-                if (process_packets) {
-                    tp_budget_charge(&tenant->budget,
-                                     cycles_counter_update(s) - start_tsc,
-                                     TP_CHARGE_RX);
-                    tp_budget_record_batch(&tenant->budget, true);
-                    rx_packets += process_packets;
-                }
-                pmd->ctx.tp_source_tenant = NULL;
-                break;
-            }
         }
 
         if (!rx_packets) {
@@ -8153,6 +8122,7 @@ struct packet_batch_per_flow {
     struct dp_netdev_flow *flow;
     struct dp_netdev_tp_tenant *tp_tenant;
     bool tp_ambiguous;
+    bool tp_recirculates;
 
     struct dp_packet_batch array;
 };
@@ -8177,6 +8147,7 @@ packet_batch_per_flow_init(struct packet_batch_per_flow *batch,
     batch->flow = flow;
     batch->tp_tenant = NULL;
     batch->tp_ambiguous = false;
+    batch->tp_recirculates = false;
     dp_packet_batch_init(&batch->array);
     batch->byte_count = 0;
     batch->packet_count = 0;
@@ -8185,18 +8156,18 @@ packet_batch_per_flow_init(struct packet_batch_per_flow *batch,
 
 static struct dp_netdev_tp_tenant *
 tp_actions_tenant(struct dp_netdev_pmd_thread *pmd,
+                  const struct dp_netdev_flow *flow,
                   const struct nlattr *actions, size_t actions_len,
-                  bool *ambiguous)
+                  bool *ambiguous, bool *recirculates)
 {
     const struct nlattr *action;
     struct dp_netdev_tp_tenant *tenant = NULL;
-    bool recirculates = false;
     size_t outputs = 0;
     size_t left;
 
     NL_ATTR_FOR_EACH_UNSAFE (action, left, actions, actions_len) {
         if (nl_attr_type(action) == OVS_ACTION_ATTR_RECIRC) {
-            recirculates = true;
+            *recirculates = true;
         } else if (nl_attr_type(action) == OVS_ACTION_ATTR_CLONE
             || nl_attr_type(action) == OVS_ACTION_ATTR_LB_OUTPUT
             || nl_attr_type(action) == OVS_ACTION_ATTR_TUNNEL_PUSH
@@ -8214,8 +8185,21 @@ tp_actions_tenant(struct dp_netdev_pmd_thread *pmd,
             }
         }
     }
-    if (outputs == 1 && tenant && !recirculates) {
+    if (outputs == 1 && tenant && !*recirculates) {
         return tenant;
+    }
+    if (!outputs && *recirculates) {
+        uint32_t port_no;
+
+        atomic_read_relaxed(&flow->tp_output_port, &port_no);
+        if (u32_to_odp(port_no) != ODPP_NONE) {
+            struct tx_port *port = pmd_send_port_cache_lookup(
+                pmd, u32_to_odp(port_no));
+
+            if (port && port->tp_tenant) {
+                return port->tp_tenant;
+            }
+        }
     }
     *ambiguous = outputs > 0;
     return NULL;
@@ -8247,10 +8231,22 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
                                      pmd->tp_refill_cycles,
                                      pmd->tp_refill_quantum,
                                      pmd->tp_max_budget);
-        if (!funded && pmd->ctx.tp_protected_work) {
+        if (!funded && (batch->tp_recirculates
+                        || pmd->ctx.tp_protected_work)) {
             size_t count = dp_packet_batch_size(&batch->array);
 
             tp_budget_record_drop(&batch->tp_tenant->budget, count);
+            if (pmd->ctx.tp_frame) {
+                struct tp_account_frame *parent = pmd->ctx.tp_frame;
+
+                if (parent->tenant
+                    && parent->tenant != batch->tp_tenant) {
+                    parent->ambiguous = true;
+                } else {
+                    parent->tenant = batch->tp_tenant;
+                }
+                parent->slack = true;
+            }
             dp_packet_delete_batch(&batch->array, true);
             return;
         }
@@ -8268,6 +8264,10 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
         uint64_t elapsed = cycles_counter_update(&pmd->perf_stats) - start_tsc;
 
         pmd->ctx.tp_frame = frame.parent;
+        if (frame.tenant && !frame.ambiguous) {
+            atomic_store_relaxed(&flow->tp_output_port,
+                                 odp_to_u32(frame.tenant->port->port_no));
+        }
         if (frame.parent) {
             if (frame.ambiguous || (frame.parent->tenant
                                     && frame.parent->tenant != frame.tenant)) {
@@ -8928,8 +8928,8 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
                 dp_netdev_flow_get_actions(batches[i].flow);
 
             batches[i].tp_tenant = tp_actions_tenant(
-                pmd, actions->actions, actions->size,
-                &batches[i].tp_ambiguous);
+                pmd, batches[i].flow, actions->actions, actions->size,
+                &batches[i].tp_ambiguous, &batches[i].tp_recirculates);
             if (batches[i].tp_tenant
                 && tp_budget_is_funded(&batches[i].tp_tenant->budget,
                                         cycles_counter_update(
